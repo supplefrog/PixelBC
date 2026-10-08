@@ -1,0 +1,20 @@
+{
+  "wrapper_repo": "https://github.com/leegao/bionic-vulkan-wrapper.git",
+  "wrapper_commit": "c8baafbd4f4835ca103acb55ec3ac13642b6b7e3",
+  "ndk_version": "30.0.16248370",
+  "ndk_url": "https://dl.google.com/android/repository/android-ndk-r30-linux.zip",
+  "ndk_sha1": "5107f898313790e449e87eee2183d9a20602dee9",
+  "ndk_bytes": 738633529,
+  "adrenotools_repo": "https://github.com/bylaws/libadrenotools.git",
+  "adrenotools_commit": "8fae8ce254dfc1344527e05301e43f37dea2df80",
+  "nfs_mobile_repo": "https://github.com/victorgbd/NFSMW-Recompiled-Mobile.git",
+  "nfs_mobile_commit": "3d9358e13dd6a10fb4b82f64040cddd07b215362",
+  "nfs_native_repo": "https://github.com/codepdbh/nfsmw-android.git",
+  "nfs_native_commit": "6df1501974d0db84893f5a3ca465b616414f6961",
+  "glslang_version": "15.2.0",
+  "spirv_tools_version": "2025.1",
+  "cmake_version": "3.31.6",
+  "ninja_version": "1.12.1",
+  "android_api": 29,
+  "android_abi": "arm64-v8a"
+}

@@ -1,0 +1,24 @@
+#version 450
+// SPDX-License-Identifier: MIT
+// Sample each cube face at texel centers through a genuine cube view.
+layout(local_size_x=8,local_size_y=8,local_size_z=1) in;
+layout(set=0,binding=0) uniform samplerCube tex;
+layout(set=0,binding=1,std430) writeonly buffer Output { uint words[]; } outbuf;
+layout(push_constant) uniform Params { uint width,height,layers,mip,snorm,srgb,offsetx,offsety; } pc;
+vec3 to_srgb(vec3 c) { return mix(12.92*c,1.055*pow(max(c,vec3(0)),vec3(1.0/2.4))-0.055,greaterThan(c,vec3(0.0031308))); }
+void main() {
+    uvec3 q=gl_GlobalInvocationID;
+    if(q.x>=pc.width||q.y>=pc.height||q.z>=6u) return;
+    vec2 uv=2.0*(vec2(q.xy)+0.5)/vec2(pc.width,pc.height)-1.0;
+    vec3 direction;
+    if(q.z==0u) direction=vec3(1.0,-uv.y,-uv.x);
+    else if(q.z==1u) direction=vec3(-1.0,-uv.y,uv.x);
+    else if(q.z==2u) direction=vec3(uv.x,1.0,uv.y);
+    else if(q.z==3u) direction=vec3(uv.x,-1.0,-uv.y);
+    else if(q.z==4u) direction=vec3(uv.x,-uv.y,1.0);
+    else direction=vec3(-uv.x,-uv.y,-1.0);
+    vec4 color=textureLod(tex,direction,float(pc.mip));
+    if(pc.srgb!=0u) color.rgb=to_srgb(color.rgb);
+    uvec4 bytes=uvec4(round(clamp(color,0.0,1.0)*255.0));
+    outbuf.words[(q.z*pc.height+q.y)*pc.width+q.x]=bytes.r|(bytes.g<<8u)|(bytes.b<<16u)|(bytes.a<<24u);
+}

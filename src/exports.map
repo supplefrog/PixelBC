@@ -1,0 +1,4 @@
+{
+    global: HMI; vkGetInstanceProcAddr; vkGetDeviceProcAddr; pvb_get_stats; pvb_get_version; pvb_get_transfer_stats;
+    local: *;
+};
