@@ -1,0 +1,361 @@
+#version 450
+// SPDX-License-Identifier: MIT
+// BC1-5 and BC7 decoding to canonical RGBA8 bytes. No texture recompression or gamma conversion.
+#ifndef PVB_SHARED_DECODE
+#define PVB_SHARED_DECODE 1
+#endif
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+layout(set=0,binding=0,std430) readonly buffer Input { uint words[]; } src;
+layout(set=0,binding=1,std430) writeonly buffer Output { uint pixels[]; } dst;
+layout(push_constant) uniform Params { uint format, width, height, layers, blocksRow, blocksHeight; } pc;
+
+uint index3(uvec2 b, uint p) {
+    uint bit = 16u + p*3u;
+    if (bit < 30u) return (b.x >> bit) & 7u;
+    if (bit >= 32u) return (b.y >> (bit-32u)) & 7u;
+    return ((b.x >> 31u) | (b.y << 1u)) & 7u;
+}
+int alpha(uvec2 b, uint p, bool snorm) {
+    int a = int(b.x & 255u), z = int((b.x >> 8u)&255u);
+    if (snorm) { a=max(-127,(a<<24)>>24); z=max(-127,(z<<24)>>24); }
+    uint i=index3(b,p);
+    if(i==0u) return a;
+    if(i==1u) return z;
+    int denominator = a>z ? 7 : 5;
+    if(a<=z && i>=6u) return i==6u ? (snorm ? -127 : 0) : (snorm ? 127 : 255);
+    int n=int(i)-1;
+    // Round to nearest, with half values toward positive infinity; no signed division ambiguity.
+    return int(floor(float((denominator-n)*a+n*z)/float(denominator)+0.5));
+}
+uvec3 expand565(uint c) { return uvec3(((c>>11u)&31u)*255u+15u, ((c>>5u)&63u)*255u+31u, (c&31u)*255u+15u)/uvec3(31u,63u,31u); }
+uvec4 color(uvec2 b,uint p,bool force4,bool opaqueRgb) {
+    uint c0=b.x&65535u,c1=b.x>>16u,i=(b.y>>(2u*p))&3u;
+    uvec3 a=expand565(c0), z=expand565(c1), result;
+    if(i==0u) result=a;
+    else if(i==1u) result=z;
+    else if(c0>c1 || force4) result=(i==2u ? 2u*a+z : a+2u*z)/3u;
+    else if(i==2u) result=(a+z)/2u;
+    else return uvec4(0,0,0,opaqueRgb ? 255u : 0u);
+    return uvec4(result,255u);
+}
+
+// BC7 tables and decoding adapted from bcdec v0.98, Copyright (c) 2022 Sergii Kudlai.
+// Pinned source: Leegao/bionic-vulkan-wrapper c8baafbd4f4835ca103acb55ec3ac13642b6b7e3,
+// src/vulkan/wrapper/bcdec.h (original SHA256 8c972cdebba2c799d8d7478fc676be6d89a95294f012985a4253d80e82d0785d).
+// Tables originate from ARB_texture_compression_bptc, as documented by bcdec.
+// The MIT permission and warranty notice is retained in licenses/bcdec-MIT.txt.
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+// of the Software, and to permit persons to whom the Software is furnished to do
+// so, subject to the following conditions:
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// x packs sixteen 2-bit subset labels; y marks the anchors with one fewer index bit.
+const uvec2 bc7Partitions2[64] = uvec2[64](
+    uvec2(0x50505050u, 0x8001u), // 0
+    uvec2(0x40404040u, 0x8001u), // 1
+    uvec2(0x54545454u, 0x8001u), // 2
+    uvec2(0x54505040u, 0x8001u), // 3
+    uvec2(0x50404000u, 0x8001u), // 4
+    uvec2(0x55545450u, 0x8001u), // 5
+    uvec2(0x55545040u, 0x8001u), // 6
+    uvec2(0x54504000u, 0x8001u), // 7
+    uvec2(0x50400000u, 0x8001u), // 8
+    uvec2(0x55555450u, 0x8001u), // 9
+    uvec2(0x55544000u, 0x8001u), // 10
+    uvec2(0x54400000u, 0x8001u), // 11
+    uvec2(0x55555440u, 0x8001u), // 12
+    uvec2(0x55550000u, 0x8001u), // 13
+    uvec2(0x55555500u, 0x8001u), // 14
+    uvec2(0x55000000u, 0x8001u), // 15
+    uvec2(0x55150100u, 0x8001u), // 16
+    uvec2(0x00004054u, 0x0005u), // 17
+    uvec2(0x15010000u, 0x0101u), // 18
+    uvec2(0x00405054u, 0x0005u), // 19
+    uvec2(0x00004050u, 0x0005u), // 20
+    uvec2(0x15050100u, 0x0101u), // 21
+    uvec2(0x05010000u, 0x0101u), // 22
+    uvec2(0x40505054u, 0x8001u), // 23
+    uvec2(0x00404050u, 0x0005u), // 24
+    uvec2(0x05010100u, 0x0101u), // 25
+    uvec2(0x14141414u, 0x0005u), // 26
+    uvec2(0x05141450u, 0x0005u), // 27
+    uvec2(0x01155440u, 0x0101u), // 28
+    uvec2(0x00555500u, 0x0101u), // 29
+    uvec2(0x15014054u, 0x0005u), // 30
+    uvec2(0x05414150u, 0x0005u), // 31
+    uvec2(0x44444444u, 0x8001u), // 32
+    uvec2(0x55005500u, 0x8001u), // 33
+    uvec2(0x11441144u, 0x0041u), // 34
+    uvec2(0x05055050u, 0x0101u), // 35
+    uvec2(0x05500550u, 0x0005u), // 36
+    uvec2(0x11114444u, 0x0101u), // 37
+    uvec2(0x41144114u, 0x8001u), // 38
+    uvec2(0x44111144u, 0x8001u), // 39
+    uvec2(0x15055054u, 0x0005u), // 40
+    uvec2(0x01055040u, 0x0101u), // 41
+    uvec2(0x05041050u, 0x0005u), // 42
+    uvec2(0x05455150u, 0x0005u), // 43
+    uvec2(0x14414114u, 0x0005u), // 44
+    uvec2(0x50050550u, 0x8001u), // 45
+    uvec2(0x41411414u, 0x8001u), // 46
+    uvec2(0x00141400u, 0x0041u), // 47
+    uvec2(0x00041504u, 0x0041u), // 48
+    uvec2(0x00105410u, 0x0005u), // 49
+    uvec2(0x10541000u, 0x0041u), // 50
+    uvec2(0x04150400u, 0x0101u), // 51
+    uvec2(0x50410514u, 0x8001u), // 52
+    uvec2(0x41051450u, 0x8001u), // 53
+    uvec2(0x05415014u, 0x0005u), // 54
+    uvec2(0x14054150u, 0x0005u), // 55
+    uvec2(0x41050514u, 0x8001u), // 56
+    uvec2(0x41505014u, 0x8001u), // 57
+    uvec2(0x40011554u, 0x8001u), // 58
+    uvec2(0x54150140u, 0x8001u), // 59
+    uvec2(0x50505500u, 0x8001u), // 60
+    uvec2(0x00555050u, 0x0005u), // 61
+    uvec2(0x15151010u, 0x0005u), // 62
+    uvec2(0x54540404u, 0x8001u) // 63
+);
+const uvec2 bc7Partitions3[64] = uvec2[64](
+    uvec2(0xaa685050u, 0x8009u), // 0
+    uvec2(0x6a5a5040u, 0x0109u), // 1
+    uvec2(0x5a5a4200u, 0x8101u), // 2
+    uvec2(0x5450a0a8u, 0x8009u), // 3
+    uvec2(0xa5a50000u, 0x8101u), // 4
+    uvec2(0xa0a05050u, 0x8009u), // 5
+    uvec2(0x5555a0a0u, 0x8009u), // 6
+    uvec2(0x5a5a5050u, 0x8101u), // 7
+    uvec2(0xaa550000u, 0x8101u), // 8
+    uvec2(0xaa555500u, 0x8101u), // 9
+    uvec2(0xaaaa5500u, 0x8041u), // 10
+    uvec2(0x90909090u, 0x8041u), // 11
+    uvec2(0x94949494u, 0x8041u), // 12
+    uvec2(0xa4a4a4a4u, 0x8021u), // 13
+    uvec2(0xa9a59450u, 0x8009u), // 14
+    uvec2(0x2a0a4250u, 0x0109u), // 15
+    uvec2(0xa5945040u, 0x8009u), // 16
+    uvec2(0x0a425054u, 0x0109u), // 17
+    uvec2(0xa5a5a500u, 0x8101u), // 18
+    uvec2(0x55a0a0a0u, 0x8009u), // 19
+    uvec2(0xa8a85454u, 0x8009u), // 20
+    uvec2(0x6a6a4040u, 0x0109u), // 21
+    uvec2(0xa4a45000u, 0x8041u), // 22
+    uvec2(0x1a1a0500u, 0x0501u), // 23
+    uvec2(0x0050a4a4u, 0x0029u), // 24
+    uvec2(0xaaa59090u, 0x8101u), // 25
+    uvec2(0x14696914u, 0x0141u), // 26
+    uvec2(0x69691400u, 0x0441u), // 27
+    uvec2(0xa08585a0u, 0x8101u), // 28
+    uvec2(0xaa821414u, 0x8021u), // 29
+    uvec2(0x50a4a450u, 0x8401u), // 30
+    uvec2(0x6a5a0200u, 0x8101u), // 31
+    uvec2(0xa9a58000u, 0x8101u), // 32
+    uvec2(0x5090a0a8u, 0x8009u), // 33
+    uvec2(0xa8a09050u, 0x8009u), // 34
+    uvec2(0x24242424u, 0x0421u), // 35
+    uvec2(0x00aa5500u, 0x0441u), // 36
+    uvec2(0x24924924u, 0x0501u), // 37
+    uvec2(0x24499224u, 0x0301u), // 38
+    uvec2(0x50a50a50u, 0x8401u), // 39
+    uvec2(0x500aa550u, 0x8041u), // 40
+    uvec2(0xaaaa4444u, 0x8009u), // 41
+    uvec2(0x66660000u, 0x8101u), // 42
+    uvec2(0xa5a0a5a0u, 0x8021u), // 43
+    uvec2(0x50a050a0u, 0x8009u), // 44
+    uvec2(0x69286928u, 0x8041u), // 45
+    uvec2(0x44aaaa44u, 0x8041u), // 46
+    uvec2(0x66666600u, 0x8101u), // 47
+    uvec2(0xaa444444u, 0x8009u), // 48
+    uvec2(0x54a854a8u, 0x8009u), // 49
+    uvec2(0x95809580u, 0x8021u), // 50
+    uvec2(0x96969600u, 0x8021u), // 51
+    uvec2(0xa85454a8u, 0x8021u), // 52
+    uvec2(0x80959580u, 0x8101u), // 53
+    uvec2(0xaa141414u, 0x8021u), // 54
+    uvec2(0x96960000u, 0x8401u), // 55
+    uvec2(0xaaaa1414u, 0x8021u), // 56
+    uvec2(0xa05050a0u, 0x8401u), // 57
+    uvec2(0xa0a5a5a0u, 0x8101u), // 58
+    uvec2(0x96000000u, 0xa001u), // 59
+    uvec2(0x40804080u, 0x8009u), // 60
+    uvec2(0xa9a8a9a8u, 0x9001u), // 61
+    uvec2(0xaaaaaa44u, 0x8009u), // 62
+    uvec2(0x2a4a5254u, 0x0109u) // 63
+);
+const uint bc7ColorBits[8] = uint[8](4u,6u,5u,7u,5u,7u,7u,5u);
+const uint bc7AlphaBits[8] = uint[8](0u,0u,0u,0u,6u,8u,7u,5u);
+const uint bc7Weight2[4] = uint[4](0u,21u,43u,64u);
+const uint bc7Weight3[8] = uint[8](0u,9u,18u,27u,37u,46u,55u,64u);
+const uint bc7Weight4[16] = uint[16](0u,4u,9u,13u,17u,21u,26u,30u,34u,38u,43u,47u,51u,55u,60u,64u);
+uint bc7Read(uvec4 block, inout uint bit, uint count) {
+    if(count==0u) return 0u;
+    uint word=bit/32u, shift=bit%32u;
+    uint result=block[word]>>shift;
+    if(shift+count>32u) result|=block[word+1u]<<(32u-shift);
+    bit+=count;
+    return result&((1u<<count)-1u);
+}
+uint bc7Weight(uint bits,uint index) {
+    return bits==2u ? bc7Weight2[index] : (bits==3u ? bc7Weight3[index] : bc7Weight4[index]);
+}
+struct Bc7Parsed { uint mode,bit,subsets,rotation,selection; uvec2 shape; uvec4 endpoints[6]; };
+Bc7Parsed bc7Parse(uvec4 block) {
+    Bc7Parsed parsed;
+    uint bit=0u,mode=0u;
+    while(mode<8u) { if(bc7Read(block,bit,1u)!=0u) break; ++mode; }
+    parsed.mode=mode;
+    if(mode==8u) return parsed; // Reserved zero-mode blocks are transparent black.
+    uint subsets=1u,partitionId=0u,rotation=0u,selection=0u;
+    if(mode<=3u||mode==7u) {
+        subsets=(mode==0u||mode==2u) ? 3u : 2u;
+        partitionId=bc7Read(block,bit,mode==0u ? 4u : 6u);
+    }
+    if(mode==4u||mode==5u) {
+        rotation=bc7Read(block,bit,2u);
+        if(mode==4u) selection=bc7Read(block,bit,1u);
+    }
+    uint count=subsets*2u;
+    uvec4 endpoints[6];
+    for(uint i=0u;i<6u;++i) endpoints[i]=uvec4(0u);
+    for(uint ch=0u;ch<3u;++ch) for(uint i=0u;i<count;++i)
+        endpoints[i][ch]=bc7Read(block,bit,bc7ColorBits[mode]);
+    if(bc7AlphaBits[mode]!=0u) for(uint i=0u;i<count;++i)
+        endpoints[i].a=bc7Read(block,bit,bc7AlphaBits[mode]);
+    bool pbits=(0xcbu&(1u<<mode))!=0u;
+    if(pbits) {
+        for(uint i=0u;i<count;++i) endpoints[i]<<=1u;
+        if(mode==1u) {
+            uint shared0=bc7Read(block,bit,1u),shared1=bc7Read(block,bit,1u);
+            for(uint i=0u;i<count;++i) endpoints[i].rgb|=uvec3(i<2u ? shared0 : shared1);
+        } else {
+            for(uint i=0u;i<count;++i) endpoints[i]|=uvec4(bc7Read(block,bit,1u));
+        }
+    }
+    uint colorBits=bc7ColorBits[mode]+(pbits ? 1u : 0u);
+    uint alphaBits=bc7AlphaBits[mode]+(pbits ? 1u : 0u);
+    for(uint i=0u;i<count;++i) {
+        endpoints[i].rgb<<=(8u-colorBits);
+        endpoints[i].rgb|=endpoints[i].rgb>>colorBits;
+        if(bc7AlphaBits[mode]==0u) endpoints[i].a=255u;
+        else { endpoints[i].a<<=(8u-alphaBits); endpoints[i].a|=endpoints[i].a>>alphaBits; }
+    }
+    uvec2 shape=subsets==1u ? uvec2(0u,1u) : (subsets==2u ? bc7Partitions2[partitionId] : bc7Partitions3[partitionId]);
+    parsed.bit=bit; parsed.subsets=subsets; parsed.rotation=rotation; parsed.selection=selection; parsed.shape=shape;
+    for(uint i=0u;i<6u;++i) parsed.endpoints[i]=endpoints[i];
+    return parsed;
+}
+uvec4 bc7Pixel(uvec4 block,uint p,Bc7Parsed parsed) {
+    uint mode=parsed.mode;
+    if(mode==8u) return uvec4(0u);
+    uint bit=parsed.bit,subsets=parsed.subsets,rotation=parsed.rotation,selection=parsed.selection;
+    uvec2 shape=parsed.shape;
+    uint subset=(shape.x>>(p*2u))&3u;
+    uint bits=(mode<=1u ? 3u : (mode==6u ? 4u : 2u));
+    uint bits2=(mode==4u ? 3u : (mode==5u ? 2u : 0u));
+    // Index streams are separate. Seek using the number of earlier anchor bits.
+    uint primary=bit+p*bits-uint(bitCount(shape.y&((1u<<p)-1u)));
+    uint index=bc7Read(block,primary,bits-((shape.y>>p)&1u));
+    uint colorWeight=bc7Weight(bits,index),alphaWeight=colorWeight;
+    if(bits2!=0u) {
+        uint secondary=bit+16u*bits-subsets+p*bits2-(p==0u ? 0u : 1u);
+        uint index2=bc7Read(block,secondary,bits2-(p==0u ? 1u : 0u));
+        uint weight2=bc7Weight(bits2,index2);
+        if(selection==0u) alphaWeight=weight2;
+        else { alphaWeight=colorWeight; colorWeight=weight2; }
+    }
+    uvec4 weights=uvec4(colorWeight,colorWeight,colorWeight,alphaWeight);
+    uvec4 rgba=((64u-weights)*parsed.endpoints[subset*2u]+weights*parsed.endpoints[subset*2u+1u]+32u)>>6u;
+    if(rotation!=0u) { uint value=rgba[rotation-1u]; rgba[rotation-1u]=rgba.a; rgba.a=value; }
+    return rgba;
+}
+
+uvec4 bc7(uvec4 block,uint p) { return bc7Pixel(block,p,bc7Parse(block)); }
+#if PVB_SHARED_DECODE
+// Four compressed blocks in an 8x8 group. Every lane reaches the barrier,
+// including inactive edge/tiny-mip pixels. No subgroup-size assumption.
+shared Bc7Parsed sharedBc7[4];
+shared uvec4 sharedColor[16];
+shared int sharedAlpha[64];
+#endif
+void main() {
+    uvec3 q=gl_GlobalInvocationID;
+
+    bool bc1=pc.format<=134u,bc4=pc.format==139u||pc.format==140u;
+    uint wordsPerBlock=(bc1||bc4) ? 2u : 4u;
+    uint base=((q.z*pc.blocksHeight+q.y/4u)*pc.blocksRow+q.x/4u)*wordsPerBlock;
+    uint p=(q.y&3u)*4u+(q.x&3u);
+    bool pixelActive=q.x<pc.width && q.y<pc.height && q.z<pc.layers;
+#if PVB_SHARED_DECODE
+    uint groupBlock=(gl_LocalInvocationID.y/4u)*2u+gl_LocalInvocationID.x/4u;
+    bool blockActive=(q.x&~3u)<pc.width && (q.y&~3u)<pc.height && q.z<pc.layers;
+    if(blockActive) {
+        uvec2 b=uvec2(src.words[base],src.words[base+1u]);
+        if(pc.format==145u||pc.format==146u) {
+            if(p==0u) sharedBc7[groupBlock]=bc7Parse(uvec4(b,src.words[base+2u],src.words[base+3u]));
+        } else {
+            if(p<4u && pc.format<=138u) {
+                uint endpoints=bc1 ? b.x : src.words[base+2u];
+                sharedColor[groupBlock*4u+p]=color(uvec2(endpoints,p),0u,!bc1,pc.format<=132u);
+            }
+            if(p<8u && pc.format>=137u) {
+                bool snorm=pc.format==140u||pc.format==142u;
+                sharedAlpha[groupBlock*16u+p]=alpha(uvec2((b.x&65535u)|(p<<16u),0u),0u,snorm);
+                if(pc.format==141u||pc.format==142u)
+                    sharedAlpha[groupBlock*16u+8u+p]=alpha(uvec2((src.words[base+2u]&65535u)|(p<<16u),0u),0u,snorm);
+            }
+        }
+    }
+    barrier();
+#endif
+    if(!pixelActive) return;
+    uvec2 first=uvec2(src.words[base],src.words[base+1u]);
+    uvec4 rgba;
+    if(bc1) {
+#if PVB_SHARED_DECODE
+        rgba=sharedColor[groupBlock*4u+((first.y>>(2u*p))&3u)];
+#else
+        rgba=color(first,p,false,pc.format<=132u);
+#endif
+    }
+    else if(pc.format<=138u) {
+#if PVB_SHARED_DECODE
+        rgba=sharedColor[groupBlock*4u+((src.words[base+3u]>>(2u*p))&3u)];
+#else
+        rgba=color(uvec2(src.words[base+2u],src.words[base+3u]),p,true,false);
+#endif
+        if(pc.format<=136u) rgba.a=((first[p/8u]>>((p%8u)*4u))&15u)*17u;
+        else {
+#if PVB_SHARED_DECODE
+            rgba.a=uint(sharedAlpha[groupBlock*16u+index3(first,p)]);
+#else
+            rgba.a=uint(alpha(first,p,false));
+#endif
+        }
+    } else if(pc.format==145u||pc.format==146u) {
+#if PVB_SHARED_DECODE
+        rgba=bc7Pixel(uvec4(first,src.words[base+2u],src.words[base+3u]),p,sharedBc7[groupBlock]);
+#else
+        rgba=bc7(uvec4(first,src.words[base+2u],src.words[base+3u]),p);
+#endif
+    } else {
+        bool snorm=pc.format==140u||pc.format==142u;
+#if PVB_SHARED_DECODE
+        rgba=uvec4(uint(sharedAlpha[groupBlock*16u+index3(first,p)])&255u,0,0,snorm?127u:255u);
+        if(!bc4) rgba.g=uint(sharedAlpha[groupBlock*16u+8u+index3(uvec2(src.words[base+2u],src.words[base+3u]),p)])&255u;
+#else
+        rgba=uvec4(uint(alpha(first,p,snorm))&255u,0,0,snorm?127u:255u);
+        if(!bc4) rgba.g=uint(alpha(uvec2(src.words[base+2u],src.words[base+3u]),p,snorm))&255u;
+#endif
+    }
+    dst.pixels[(q.z*pc.height+q.y)*pc.width+q.x]=rgba.r|(rgba.g<<8u)|(rgba.b<<16u)|(rgba.a<<24u);
+}

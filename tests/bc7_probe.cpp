@@ -85,12 +85,15 @@ void bc7_direct(App &a) {
     auto fixtures=bc7_corpus(); constexpr uint32_t br=64;
     const uint32_t bh=(uint32_t(fixtures.size())+br-1)/br,width=br*4,height=bh*4;
     const uint64_t output_bytes=uint64_t(width)*height*4,input_bytes=uint64_t(br)*bh*16;
+    VkPhysicalDeviceProperties properties{}; a.GetPhysicalDeviceProperties(a.physical,&properties);
+    const uint64_t alignment=std::max<uint64_t>(1,properties.limits.minStorageBufferOffsetAlignment);
+    const uint64_t guard=(64+alignment-1)/alignment*alignment;
     DiagnosticResources owned(a);
-    owned.input=a.buffer(input_bytes+128,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    owned.output=a.buffer(output_bytes+128,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    std::memset(owned.input.mapped,0,size_t(input_bytes+128));
-    std::memset(owned.output.mapped,0xa5,size_t(output_bytes+128));
-    auto raw=static_cast<uint8_t*>(owned.input.mapped)+64;
+    owned.input=a.buffer(input_bytes+guard*2,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    owned.output=a.buffer(output_bytes+guard*2,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::memset(owned.input.mapped,0,size_t(input_bytes+guard*2));
+    std::memset(owned.output.mapped,0xa5,size_t(output_bytes+guard*2));
+    auto raw=static_cast<uint8_t*>(owned.input.mapped)+guard;
     for(size_t n=0;n<fixtures.size();++n) std::memcpy(raw+n*16,fixtures[n].block.data(),16);
     VkDescriptorSetLayoutBinding bindings[2]={{0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}};
     VkDescriptorSetLayoutCreateInfo ds{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; ds.bindingCount=2; ds.pBindings=bindings;
@@ -105,14 +108,14 @@ void bc7_direct(App &a) {
     require(a.CreateDescriptorPool(a.device,&pool,nullptr,&owned.pool),"BC7 direct pool");
     VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocate.descriptorPool=owned.pool; allocate.descriptorSetCount=1; allocate.pSetLayouts=&owned.descriptors; VkDescriptorSet set{};
     require(a.AllocateDescriptorSets(a.device,&allocate,&set),"BC7 direct set");
-    VkDescriptorBufferInfo buffers[2]={{owned.input.handle,64,input_bytes},{owned.output.handle,64,output_bytes}}; VkWriteDescriptorSet writes[2]{};
+    VkDescriptorBufferInfo buffers[2]={{owned.input.handle,guard,input_bytes},{owned.output.handle,guard,output_bytes}}; VkWriteDescriptorSet writes[2]{};
     for(uint32_t n=0;n<2;++n) { writes[n].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[n].dstSet=set; writes[n].dstBinding=n; writes[n].descriptorCount=1; writes[n].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[n].pBufferInfo=&buffers[n]; }
     a.UpdateDescriptorSets(a.device,2,writes,0,nullptr);
     owned.begin(); uint32_t push[6]={145,width,height,1,br,bh};
     a.CmdBindPipeline(a.command,VK_PIPELINE_BIND_POINT_COMPUTE,owned.pipeline); a.CmdBindDescriptorSets(a.command,VK_PIPELINE_BIND_POINT_COMPUTE,owned.layout,0,1,&set,0,nullptr); a.CmdPushConstants(a.command,owned.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),push); a.CmdDispatch(a.command,(width+7)/8,(height+7)/8,1);
     VkBufferMemoryBarrier host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER}; host.buffer=owned.output.handle; host.size=VK_WHOLE_SIZE; host.srcQueueFamilyIndex=host.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; host.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; host.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
     a.CmdPipelineBarrier(a.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&host,0,nullptr); a.submit();
-    auto bytes=static_cast<uint8_t*>(owned.output.mapped),actual=bytes+64;
+    auto bytes=static_cast<uint8_t*>(owned.output.mapped),actual=bytes+guard;
     uint32_t mode_counts[9]{},mode_failures[9]{};
     for(size_t n=0;n<size_t(br)*bh;++n) {
         auto expected=bc7_reference(raw+n*16); bool equal=true;
@@ -129,7 +132,7 @@ void bc7_direct(App &a) {
         }
         if(n>=fixtures.size()||fixtures[n].mode==8) check(std::all_of(expected.begin(),expected.end(),[](uint8_t v){return v==0;}),"Invalid zero-mode reference is literal transparent black");
     }
-    check(std::all_of(bytes,bytes+64,[](uint8_t v){return v==0xa5;}) && std::all_of(actual+output_bytes,actual+output_bytes+64,[](uint8_t v){return v==0xa5;}),"BC7 direct decoder preserves SSBO bounds guards");
+    check(std::all_of(bytes,bytes+guard,[](uint8_t v){return v==0xa5;}) && std::all_of(actual+output_bytes,actual+output_bytes+guard,[](uint8_t v){return v==0xa5;}),"BC7 direct decoder preserves SSBO bounds guards");
     Bc7Block zero{}; zero[0]=0x40; const auto transparent=bc7_reference(zero.data());
     check(std::all_of(transparent.begin(),transparent.end(),[](uint8_t v){return v==0;}),"Mode6 zero endpoints have literal RGBA zero");
     Bc7Block full{}; full.fill(255); full[0]=0xc0; const auto white=bc7_reference(full.data());

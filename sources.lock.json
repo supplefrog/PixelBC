@@ -16,5 +16,13 @@
   "cmake_version": "3.31.6",
   "ninja_version": "1.12.1",
   "android_api": 29,
-  "android_abi": "arm64-v8a"
+  "android_abi": "arm64-v8a",
+  "etc2_encoder_repo": "https://github.com/leegao/etc2_encode",
+  "etc2_encoder_commit": "a32883c1f5f66358403060e1f180714ee241dae6",
+  "etc2_oracle_repo": "https://github.com/hglm/detex",
+  "etc2_oracle_commit": "cab11584d9be140602a66fd9a88ef0b99f08a97a",
+  "etc2_spec_repo": "https://github.com/KhronosGroup/DataFormat",
+  "etc2_spec_commit": "8020b6258d969562e82d3005cba24bd8e6633940",
+  "host_native_etc2_backend_repo": "https://github.com/google/swiftshader",
+  "host_native_etc2_backend_commit": "0f87bb2d3742c2992fd1a7dcb2f051eebf79299c"
 }

@@ -1,0 +1,18 @@
+#version 450
+// SPDX-License-Identifier: MIT
+layout(local_size_x=8,local_size_y=8,local_size_z=1) in;
+layout(set=0,binding=0) uniform sampler2DArray tex;
+layout(set=0,binding=1,std430) writeonly buffer Output { uint words[]; } outbuf;
+layout(push_constant) uniform Params { uint width,height,layers,mip,snorm,srgb,offsetx,offsety; } pc;
+vec3 to_srgb(vec3 c) { return mix(12.92*c,1.055*pow(max(c,vec3(0)),vec3(1.0/2.4))-0.055,greaterThan(c,vec3(0.0031308))); }
+void main() {
+    uvec3 q=gl_GlobalInvocationID;
+    if(q.x>=pc.width||q.y>=pc.height||q.z>=pc.layers) return;
+    // Texel centers are (q + 0.5) / size. A half-texel offset puts this
+    // sample equally between four neighbors, including block boundaries.
+    vec2 uv=(vec2(q.xy)+vec2(1.0))/vec2(textureSize(tex,int(pc.mip)).xy);
+    vec4 color=textureLod(tex,vec3(uv,float(q.z)),float(pc.mip));
+    if(pc.srgb!=0u) color.rgb=to_srgb(color.rgb);
+    uvec4 bytes=uvec4(round(clamp(color,0.0,1.0)*255.0));
+    outbuf.words[(q.z*pc.height+q.y)*pc.width+q.x]=bytes.r|(bytes.g<<8u)|(bytes.b<<16u)|(bytes.a<<24u);
+}

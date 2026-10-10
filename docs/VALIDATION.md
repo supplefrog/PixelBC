@@ -1,23 +1,41 @@
-# PixelBC 0.1.2 validation
+# Validation and limitations
 
-Tested locally on Pixel 7, Mali-G710, Android 17, stock ARM r54p3 backend. Results below are observations, not broad device support guarantees.
+This page distinguishes retained build/check evidence from reported local device acceptance. Preparing this source export ran byte-identity, dependency-closure, documentation and privacy checks only; it did not rebuild or rerun a device experiment.
 
-## Correctness and lifecycle
+## Reported local acceptance
 
-Two Android probe runs each passed 535 BC1–5 checks and 20,046 BC7 checks, zero failures, natural process exit. BC7 tests cover all eight modes and independent reference comparison. Cloud Linux llvmpipe tests passed 533 BC1–5 checks, 20,044 BC7 checks, nine CTest cases and zero synchronization-validation errors. Fault/lifecycle/ownership fixtures are included. Android validation layers were unavailable on the phone. Cloud builds were repeated twice with byte-identical library, probes, shaders and package.
+The exact 0.1.9 library and package hashes are in [HANDOFF.md](../HANDOFF.md). On stock Pixel 7 / Mali-G710, the targeted policy probe passed 286/0. Its missing-final-dispatch control produced 278/8 and the intended exit 1 with natural cleanup. These checks exercise actual image backing, query/create agreement, sampled data, original-source alpha and resource paths, rather than inferring correctness from allocation sizes.
 
-The locally imported candidate ZIP SHA256 was `c0b7bf95db6f6cd6ef33e0432170b8659c89933bef2818d198a1e4c796fcd585`; library SHA256 was `8ed57f27f6900b14a1d40fbdc2b5f7c2fb6924d381a30bd77d70097f8b60d88e`. This source export does not redistribute that binary package.
+Focused game runtime was verified for NFS Most Wanted Mobile 0.4.0 and Unleashed Android 0.6.0. Both selected 0.1.9 at handoff. User reports of fewer Sonic hitches are subjective; there is no matched high-load performance proof. No three qualifying 60-second racing runs passed max displayed gap 50 ms and p99 25 ms, and input latency was not established. Recent capped plaza comparisons did not resolve the designated hub/night scenes. Slight color/shadow differences were uncertain at low brightness, not a confirmed regression or display diagnosis. Android Vulkan validation layers were unavailable during these device tests.
 
-## NFSMW
+## Retained source/build evidence
 
-Actual game tested: victorgbd/NFSMW-Recompiled-Mobile 0.4.0, USA game edition, native renderer pinned at codepdbh/nfsmw-android commit `6df1501974d0db84893f5a3ca465b616414f6961`. Logs confirmed wrapper activation and first GPU BC decode; a 3D race rendered. This does not establish tests of codepdbh's own APK. Subjective smoother play was reported, but resolution/upscaling/settings also changed during the broader session: no isolated wrapper FPS gain is claimed.
+The prior ARM64/API 29 static-C++ builds reproduced the stripped library byte-for-byte. The packaged ELF was checked for 16 KiB load alignment, `NODELETE`, Android HAL ABI and public system-library dependencies. Exact build/dependency pins remain in [sources.lock.json](../sources.lock.json). This export preserves tested code bytes but does not promise that arbitrary tool versions produce the same binary.
 
-## Unleashed
+Production shader identities from those builds:
 
-SansNope/UnleashedRecomp-Android 0.6.0, source pin `f9ad6baffe32637ff45f34825c247513e8b379d7`. Import and ordinary loading succeeded. To test GPU decode, the app's existing `driver_import/force_bc.txt` override was enabled after a bounded asset/source audit. BC1/2/3 and embedded BC7 decoding appeared in runtime logs; Apotos hub and a heavier populated daytime area rendered without observed missing textures or driver rejection. A relaunch repeated first GPU decode and returned to playable gameplay.
+| Module | Bytes | SHA256 |
+| --- | ---: | --- |
+| BC decode | 33,720 | `4172fae7cea312276365c1691f7b1db915b1abbce5d1c1753b111c169ab7691e` |
+| Weighted BC1 ETC2 specialization | 42,856 | `2d0a4e4630632de4bca66abf6f0222783835fb01ebb9625a9bf225bab06f39d5` |
+| Corrected BC3 ETC2 specialization | 91,616 | `a5ef619b789d0d0b3805d82c15b928b2f915ff9c6ab4a9a1858a9d054e9bc785` |
 
-All 11,604 inspected LZX objects decoded, yielding 23,197 DDS headers: 14,170 BC1, 321 BC2, 8,550 BC3, 123 BGRA8 and 33 legacy FourCC-zero headers. The latter could not select BC/DX10 BC6 in the pinned parser, but precise uncompressed masks remain unclassified. Recognized shapes were 2D/cube, depth one. The source's 74 embedded DDS resources included 17 BC7 textures. Some opaque containers remain outside texture coverage; future mods and every stage are not certified.
+Independent references are the retained bcdec portability-patched CPU decoder and pinned detex ETC/EAC decoder. Probes compare original BC quality separately from native sampling of independently decoded encoded blocks. Genuine rational source alpha 0/255 coverage remains exact; rounded interpolants are classified separately. RGB RMSE32, alpha RMSE8 and BC3 maximum alpha error16 guards are unchanged.
 
-The same stationary hub ran near 59 FPS on both CPU-transcode and GPU-decode paths. PSS rose from 1,167,911 KiB to 1,793,650 KiB (about 611 MiB extra); thermal status differed, so this was not a controlled benchmark. A heavier-area GPU capture averaged 42.25 FPS with no matching CPU capture. Smoother play was reported, but no measured FPS gain is established. Retained original BC blocks support compressed readback/copies; decoded RGBA increases texture storage substantially. This route primarily targets CPU texture conversion, not per-frame draw-call/CPU bottlenecks.
+**Known failure:** a retained synthetic adversarial RGB fixture yields visible RGB RMSE45.108863, above32, including the prior baseline. It was not reclassified as passing or excluded. A retained SwiftShader native-sampling diagnostic also failed (282/2); this is not Pixel acceptance or a universal backend verdict. Synthetic held-out passes do not certify all game textures, mods or Vulkan usage.
 
-Recommended integration: opt-in, per-format and exact image-usage support checks, with CPU fallback retained. Do not make the blanket BC override default. Additional memory-constrained-device, stage, synchronization and sustained tests are needed before broader rollout.
+## Reproducible check entry points
+
+With a software Vulkan ICD, build and run the host suite using `bash scripts/test_host.sh`. Some quality/backend checks have the retained failures above; inspect results rather than treating every nonzero exit as a new regression. The source includes ownership/failure, transfer, state-history, signed-reference, backend-lifetime and native-compression contracts.
+
+With built Android probes and an explicit library in a temporary directory:
+
+```bash
+timeout 45s ./pixel_shape_policy_probe ./libvulkan_pixel_bc.so --require-native
+timeout 45s ./pixel_shape_policy_probe ./libvulkan_pixel_bc.so --require-native --omit-final-dispatch
+timeout 45s ./pixel_etc2_alpha_regression ./libvulkan_pixel_bc.so
+```
+
+The omission run is a failing control. The legacy uniform ETC2 probe/benchmark is not a mixed-policy oracle: it assumes one backing route for its arm. Use the shape-policy probe for 0.1.9 routing and sampling. Do not label the mixed library wholly ETC2 or wholly RGBA.
+
+Earlier synthetic native comparisons supported testing RGBA on the two selected shapes: complete upload work was cheaper while filtered sampling and residency were more expensive. They used serial logical devices and synthetic fixtures, not game frames. Cloud software timing is not Mali performance; conversion savings alone do not prove a gameplay hitch fix. No sampled-output expectation is derived from candidate readback, and no quality gate was weakened for this export.

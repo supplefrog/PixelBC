@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: MIT
 #include "bc_transfer_layout.h"
 #include "bc_decode_spv.h"
+#include "bc_etc2_encode_bc1_spv.h"
+#include "bc_etc2_encode_bc3_spv.h"
+#include "etc2_formats.h"
+#include "compression_stats.h"
 #include "stats.h"
 #include "transfer_stats.h"
+#include "perf_stats.h"
 #include <dlfcn.h>
 #include <algorithm>
 #include <array>
@@ -21,6 +26,15 @@
 #include "android_hal.h"
 #endif
 #define EXPORT __attribute__((visibility("default")))
+#ifndef PVB_UPLOAD_ARENAS
+#define PVB_UPLOAD_ARENAS 1
+#endif
+#ifndef PVB_COMPACT_HISTORY
+#define PVB_COMPACT_HISTORY 1
+#endif
+#ifndef PVB_ETC2
+#define PVB_ETC2 0
+#endif
 #ifdef __ANDROID__
 extern "C" EXPORT hwvulkan_module_t HMI;
 #endif
@@ -80,6 +94,8 @@ std::atomic<uint64_t> dispatches{0}, failures{0}, live_resources{0};
 std::atomic<uint64_t> live_block_stores{0}, live_block_bytes{0}, block_copy_bytes{0};
 std::atomic<uint32_t> accepted_image_formats{0}, rejected_image_formats{0};
 std::atomic<uint64_t> backend_recursion{0};
+std::atomic<uint64_t> perf_buffers{0},perf_memory{0},perf_pools{0},perf_bytes{0},perf_binds{0},perf_pushes{0};
+std::atomic<uint64_t> etc2_dispatches{0},rgba_dispatches{0},cross_backing_regenerations{0};
 struct Instance {
     VkInstance handle;
     PFN_vkGetDeviceProcAddr gdpa = nullptr;
@@ -101,6 +117,8 @@ struct Device {
     VkDescriptorSetLayout descriptors = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline etc2_pipelines[2] = {VK_NULL_HANDLE,VK_NULL_HANDLE};
+    bool native_etc2=false;
 };
 struct BlockStore {
     std::shared_ptr<Device> device;
@@ -114,12 +132,18 @@ struct BlockStore {
         if(bytes) { --live_block_stores; live_block_bytes-=bytes; }
     }
 };
-struct Image { VkFormat original; VkExtent3D extent; uint32_t mips, layers; std::shared_ptr<Device> device; std::shared_ptr<BlockStore> blocks; VkImageUsageFlags usage=0; };
+struct Image { VkFormat original; VkExtent3D extent; uint32_t mips, layers; std::shared_ptr<Device> device; std::shared_ptr<BlockStore> blocks; VkImageUsageFlags usage=0; VkFormat backing=VK_FORMAT_UNDEFINED; };
 struct Pool { std::shared_ptr<Device> device; uint32_t family; };
 struct Resource {
     VkBuffer input = VK_NULL_HANDLE, output = VK_NULL_HANDLE;
     VkDeviceMemory input_memory = VK_NULL_HANDLE, output_memory = VK_NULL_HANDLE;
     VkDescriptorPool descriptors = VK_NULL_HANDLE;
+    bool borrowed=false;
+};
+struct Arena {
+    Resource backing;
+    uint64_t input_size=0,output_size=0,input_used=0,output_used=0;
+    uint32_t sets=0;
 };
 struct ShadowLayout {
     std::shared_ptr<Device> device;
@@ -137,6 +161,7 @@ struct Command {
     std::vector<DescriptorBind> binds;
     std::vector<Push> pushes;
     std::vector<Resource> resources;
+    std::vector<Arena> arenas;
     std::vector<std::shared_ptr<BlockStore>> stores;
 };
 std::mutex maps_mutex;
@@ -154,6 +179,7 @@ template<class K,class V> V lookup(const std::unordered_map<K,V> &map,K key) {
 }
 template<class T> T resolve(PFN_vkGetInstanceProcAddr fn,VkInstance i,const char *name) { return reinterpret_cast<T>(fn(i,name)); }
 void destroy_resource(Device &d,Resource &r) {
+    if(r.borrowed) { r={}; return; }
     if(r.descriptors) d.DestroyDescriptorPool(d.handle,r.descriptors,nullptr);
     if(r.input) d.DestroyBuffer(d.handle,r.input,nullptr);
     if(r.output) d.DestroyBuffer(d.handle,r.output,nullptr);
@@ -163,6 +189,8 @@ void destroy_resource(Device &d,Resource &r) {
 }
 void reset_command(Command &c) {
     for(auto &r:c.resources) { destroy_resource(*c.device,r); --live_resources; }
+    for(auto &a:c.arenas) destroy_resource(*c.device,a.backing);
+    c.arenas.clear();
     c.resources.clear(); c.stores.clear(); c.binds.clear(); c.pushes.clear(); c.compute=VK_NULL_HANDLE; c.error=VK_SUCCESS;
 }
 void fail(Command &c,VkResult result,const char *message) {
@@ -231,9 +259,41 @@ VkResult image_properties(Instance &i,VkPhysicalDevice p,VkFormat f,VkImageType 
     if(r==VK_SUCCESS) out->sampleCounts&=VK_SAMPLE_COUNT_1_BIT;
     return r;
 }
+// Physical capabilities remain the conservative lossless RGBA contract above.
+// Optional ETC2 is selected only when every actual create field fits its native
+// limits; otherwise creation and no-image memory requirements both choose RGBA.
+VkFormat select_backing(Device &d,const VkImageCreateInfo &info) {
+    const auto recovery=pvb::rgba_format(info.format);
+    // One whole-image experiment, selected before any upload is recorded.
+    // Creation and maintenance4 queries share this selector; stored backing
+    // continues to govern views, copies and every mip/layer for its lifetime.
+    if(PVB_BC1_SHAPE_RGBA &&
+       (info.format==VK_FORMAT_BC1_RGBA_UNORM_BLOCK || info.format==VK_FORMAT_BC1_RGBA_SRGB_BLOCK) &&
+       ((info.extent.width==512 && info.extent.height==1024) ||
+        (info.extent.width==256 && info.extent.height==2048))) return recovery;
+    if(!PVB_ETC2 || !d.native_etc2 || !pvb::etc2_eligible(info.format) ||
+       !(info.usage&VK_IMAGE_USAGE_SAMPLED_BIT) || !supported_image(info.imageType,info.tiling,info.usage,info.flags) ||
+       info.samples!=VK_SAMPLE_COUNT_1_BIT || !info.extent.width || !info.extent.height || info.extent.depth!=1 ||
+       !info.mipLevels || !info.arrayLayers) return recovery;
+    const auto target=pvb::etc2_format(info.format);
+    // Both colorspaces are required so compatible mutable views have the same
+    // backing family. BC4/5 signed/unsigned and BC7 never enter this route.
+    constexpr auto required=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    const auto paired=VkFormat(pvb::rgba_format(info.format)==VK_FORMAT_R8G8B8A8_SRGB?uint32_t(target)-1u:uint32_t(target)+1u);
+    for(auto f:{target,paired}) {
+        VkFormatProperties fp{}; d.instance->GetPhysicalDeviceFormatProperties(d.physical,f,&fp);
+        if((fp.optimalTilingFeatures&required)!=required) return recovery;
+        VkImageFormatProperties ip{};
+        if(d.instance->GetPhysicalDeviceImageFormatProperties(d.physical,f,info.imageType,info.tiling,info.usage,info.flags,&ip)!=VK_SUCCESS ||
+           info.extent.width>ip.maxExtent.width || info.extent.height>ip.maxExtent.height || info.extent.depth>ip.maxExtent.depth ||
+           info.mipLevels>ip.maxMipLevels || info.arrayLayers>ip.maxArrayLayers || !(ip.sampleCounts&info.samples)) return recovery;
+    }
+    return target;
+}
 VkResult buffer(Device &d,VkDeviceSize size,VkBufferUsageFlags usage,VkBuffer &b,VkDeviceMemory &mem,const VkImageCreateInfo *sharing=nullptr) {
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; info.size=size; info.usage=usage; info.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
     if(sharing) { info.sharingMode=sharing->sharingMode; info.queueFamilyIndexCount=sharing->queueFamilyIndexCount; info.pQueueFamilyIndices=sharing->pQueueFamilyIndices; }
+    ++perf_buffers; perf_bytes+=size;
     VkResult r=d.CreateBuffer(d.handle,&info,nullptr,&b); if(r!=VK_SUCCESS) return r;
     VkMemoryRequirements req{}; d.GetBufferMemoryRequirements(d.handle,b,&req);
     uint32_t index=UINT32_MAX;
@@ -241,6 +301,7 @@ VkResult buffer(Device &d,VkDeviceSize size,VkBufferUsageFlags usage,VkBuffer &b
     if(index==UINT32_MAX) for(uint32_t n=0;n<d.memory.memoryTypeCount;++n) if(req.memoryTypeBits&(1u<<n)) { index=n; break; }
     if(index==UINT32_MAX) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; allocation.allocationSize=req.size; allocation.memoryTypeIndex=index;
+    ++perf_memory;
     r=d.AllocateMemory(d.handle,&allocation,nullptr,&mem); if(r!=VK_SUCCESS) return r;
     return d.BindBufferMemory(d.handle,b,mem,0);
 }
@@ -255,9 +316,35 @@ VkResult init_pipeline(Device &d) {
     VkShaderModule shader=VK_NULL_HANDLE; r=d.CreateShaderModule(d.handle,&sm,nullptr,&shader); if(r!=VK_SUCCESS) return r;
     VkComputePipelineCreateInfo cp{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO}; cp.stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cp.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT; cp.stage.module=shader; cp.stage.pName="main"; cp.layout=d.layout;
     r=d.CreateComputePipelines(d.handle,VK_NULL_HANDLE,1,&cp,nullptr,&d.pipeline);
-    d.DestroyShaderModule(d.handle,shader,nullptr); return r;
+    d.DestroyShaderModule(d.handle,shader,nullptr);
+    if(r==VK_SUCCESS && d.native_etc2) {
+        const uint32_t *code[2]={bc_etc2_encode_bc1_spv,bc_etc2_encode_bc3_spv};
+        const size_t bytes[2]={sizeof(bc_etc2_encode_bc1_spv),sizeof(bc_etc2_encode_bc3_spv)};
+        for(uint32_t n=0;n<2 && r==VK_SUCCESS;++n) {
+            sm.codeSize=bytes[n]; sm.pCode=code[n];
+            shader=VK_NULL_HANDLE; r=d.CreateShaderModule(d.handle,&sm,nullptr,&shader);
+            if(r==VK_SUCCESS) {
+                cp.stage.module=shader; r=d.CreateComputePipelines(d.handle,VK_NULL_HANDLE,1,&cp,nullptr,&d.etc2_pipelines[n]);
+                d.DestroyShaderModule(d.handle,shader,nullptr);
+            }
+        }
+        if(r!=VK_SUCCESS) {
+            // Native lossless pipeline already exists. An optional codec
+            // pipeline failure fixes the device's route to RGBA before any
+            // caller image/requirements query; never change an existing image.
+            for(auto &pipeline:d.etc2_pipelines) {
+                if(pipeline) d.DestroyPipeline(d.handle,pipeline,nullptr);
+                pipeline=VK_NULL_HANDLE;
+            }
+            d.native_etc2=false;
+            log_error("Optional ETC2 pipeline unavailable; using lossless RGBA for this device");
+            r=VK_SUCCESS;
+        }
+    }
+    return r;
 }
 void destroy_pipeline(Device &d) {
+    for(auto pipeline:d.etc2_pipelines) if(pipeline) d.DestroyPipeline(d.handle,pipeline,nullptr);
     if(d.pipeline) d.DestroyPipeline(d.handle,d.pipeline,nullptr);
     if(d.layout) d.DestroyPipelineLayout(d.handle,d.layout,nullptr);
     if(d.descriptors) d.DestroyDescriptorSetLayout(d.handle,d.descriptors,nullptr);
@@ -402,7 +489,24 @@ VKAPI_ATTR VkResult VKAPI_CALL pvbCreateDevice(VkPhysicalDevice physical,const V
     auto d=std::make_shared<Device>(); d->instance=i; d->physical=physical; d->gdpa=i->gdpa;
     uint32_t family_count=0; i->GetPhysicalDeviceQueueFamilyProperties(physical,&family_count,nullptr); d->families.resize(family_count); i->GetPhysicalDeviceQueueFamilyProperties(physical,&family_count,d->families.data());
     for(uint32_t n=0;n<info->queueCreateInfoCount;++n) if(info->pQueueCreateInfos[n].queueFamilyIndex>=family_count || !(d->families[info->pQueueCreateInfos[n].queueFamilyIndex].queueFlags&VK_QUEUE_COMPUTE_BIT) || info->pQueueCreateInfos[n].flags) return VK_ERROR_FEATURE_NOT_PRESENT;
-    VkResult r=i->CreateDevice(physical,info,allocator,out); if(r!=VK_SUCCESS) return r; d->handle=*out;
+    VkDeviceCreateInfo native_info=*info;
+    VkPhysicalDeviceFeatures native_features{};
+    VkPhysicalDeviceFeatures2 native_features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    if(PVB_ETC2) {
+        i->GetPhysicalDeviceFeatures(physical,&native_features);
+        const auto first=static_cast<const VkBaseInStructure*>(info->pNext);
+        const VkPhysicalDeviceFeatures2 *existing=nullptr;
+        for(auto ext=first;ext;ext=ext->pNext) if(ext->sType==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) existing=reinterpret_cast<const VkPhysicalDeviceFeatures2*>(ext);
+        // Enable a genuine internal compression dependency without mutating
+        // caller memory. Unknown prefixes ahead of Features2 are never copied
+        // by guessed struct size: that unusual chain uses the RGBA recovery.
+        if(native_features.textureCompressionETC2 && (!existing || existing==reinterpret_cast<const VkPhysicalDeviceFeatures2*>(first))) {
+            d->native_etc2=true;
+            if(existing) { native_features2=*existing; native_features2.features.textureCompressionETC2=VK_TRUE; native_info.pNext=&native_features2; }
+            else { native_features=info->pEnabledFeatures?*info->pEnabledFeatures:VkPhysicalDeviceFeatures{}; native_features.textureCompressionETC2=VK_TRUE; native_info.pEnabledFeatures=&native_features; }
+        }
+    }
+    VkResult r=i->CreateDevice(physical,&native_info,allocator,out); if(r!=VK_SUCCESS) return r; d->handle=*out;
     auto guard=rollback([&] {
         { std::lock_guard<std::mutex> lock(maps_mutex); for(auto it=queues.begin();it!=queues.end();) { if(it->second==d) it=queues.erase(it); else ++it; } }
         destroy_pipeline(*d); if(d->DestroyDevice) d->DestroyDevice(*out,allocator); *out=VK_NULL_HANDLE;
@@ -442,13 +546,13 @@ VKAPI_ATTR VkResult VKAPI_CALL pvbCreateImage(VkDevice handle,const VkImageCreat
     if(!pvb::is_any_bc(info->format)) return d->CreateImage(handle,info,allocator,out);
     if(!pvb::is_bc(info->format)) return reject_image_request(*info);
     if(!supported_image(info->imageType,info->tiling,info->usage,info->flags)|| info->samples!=VK_SAMPLE_COUNT_1_BIT || info->extent.depth!=1 || !bc_features(*d->instance,d->physical,info->format)) return reject_image_request(*info);
-    VkImageCreateInfo copy=*info; copy.format=pvb::rgba_format(info->format);
+    VkImageCreateInfo copy=*info; copy.format=select_backing(*d,*info);
     VkImageFormatListCreateInfo list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO}; std::vector<VkFormat> view_formats;
     if(info->pNext) {
         const auto p=static_cast<const VkBaseInStructure*>(info->pNext);
         if(p->sType!=VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO || p->pNext) return reject_image_request(*info);
         list=*reinterpret_cast<const VkImageFormatListCreateInfo*>(p);
-        for(uint32_t n=0;n<list.viewFormatCount;++n) { if(!pvb::is_bc(list.pViewFormats[n]) || !pvb::compatible_view(info->format,list.pViewFormats[n])) return reject_image_request(*info); view_formats.push_back(pvb::rgba_format(list.pViewFormats[n])); }
+        for(uint32_t n=0;n<list.viewFormatCount;++n) { if(!pvb::is_bc(list.pViewFormats[n]) || !pvb::compatible_view(info->format,list.pViewFormats[n])) return reject_image_request(*info); view_formats.push_back(pvb::is_etc2_backing(copy.format)?pvb::etc2_format(list.pViewFormats[n]):pvb::rgba_format(list.pViewFormats[n])); }
         list.pViewFormats=view_formats.data(); copy.pNext=&list;
     }
     VkResult r=d->CreateImage(handle,&copy,allocator,out); if(r!=VK_SUCCESS) return r;
@@ -463,7 +567,18 @@ VKAPI_ATTR VkResult VKAPI_CALL pvbCreateImage(VkDevice handle,const VkImageCreat
         if(r!=VK_SUCCESS) return r;
         store->bytes=bytes; ++live_block_stores; live_block_bytes+=bytes;
     }
-    std::lock_guard<std::mutex> lock(maps_mutex); images[*out]={info->format,info->extent,info->mipLevels,info->arrayLayers,d,std::move(store),info->usage}; guard.active=false; log_image_request(*info,true); return r;
+    std::lock_guard<std::mutex> lock(maps_mutex); images[*out]={info->format,info->extent,info->mipLevels,info->arrayLayers,d,std::move(store),info->usage,copy.format}; guard.active=false; log_image_request(*info,true);
+    // Anonymous per-format shape logging above is bounded; this route is also
+    // exposed by the aggregate compression observation ABI.
+    static std::atomic<uint32_t> routes{0}; const uint32_t bit=1u<<(uint32_t(info->format)-131u);
+    if(!(routes.fetch_or(bit)&bit)) {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO,"PixelBC","Backing route: BC format=%u native format=%u lossy_ETC2=%u native_ETC2_enabled=%u",uint32_t(info->format),uint32_t(copy.format),uint32_t(pvb::is_etc2_backing(copy.format)),uint32_t(d->native_etc2));
+#else
+        std::fprintf(stderr,"PixelBC: Backing route: BC format=%u native format=%u lossy_ETC2=%u native_ETC2_enabled=%u\n",uint32_t(info->format),uint32_t(copy.format),uint32_t(pvb::is_etc2_backing(copy.format)),uint32_t(d->native_etc2));
+#endif
+    }
+    return r;
 } catch(const std::bad_alloc&) { return VK_ERROR_OUT_OF_HOST_MEMORY; }
 VKAPI_ATTR void VKAPI_CALL pvbDestroyImage(VkDevice handle,VkImage image,const VkAllocationCallbacks *allocator) { auto d=lookup(devices,handle); if(!d) return; { std::lock_guard<std::mutex> lock(maps_mutex); images.erase(image); } d->DestroyImage(handle,image,allocator); }
 VKAPI_ATTR VkResult VKAPI_CALL pvbCreateImageView(VkDevice handle,const VkImageViewCreateInfo *info,const VkAllocationCallbacks *allocator,VkImageView *out) {
@@ -471,7 +586,7 @@ VKAPI_ATTR VkResult VKAPI_CALL pvbCreateImageView(VkDevice handle,const VkImageV
     VkImageViewCreateInfo copy=*info; auto image=lookup(images,info->image);
     if(image.device) {
         if(!pvb::is_bc(info->format) || !pvb::compatible_view(image.original,info->format)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
-        copy.format=pvb::rgba_format(info->format);
+        copy.format=pvb::is_etc2_backing(image.backing)?pvb::etc2_format(info->format):pvb::rgba_format(info->format);
     }
     return d->CreateImageView(handle,&copy,allocator,out);
 }
@@ -480,14 +595,15 @@ VKAPI_ATTR void VKAPI_CALL pvbGetDeviceImageMemoryRequirements(VkDevice handle,c
     auto copy=*info; auto create=*info->pCreateInfo;
     VkImageFormatListCreateInfo list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO}; std::vector<VkFormat> formats;
     if(pvb::is_any_bc(create.format)) {
-        if(!pvb::is_bc(create.format)) { out->memoryRequirements={}; return; }
+        if(!pvb::is_bc(create.format) || !supported_image(create.imageType,create.tiling,create.usage,create.flags) ||
+           create.samples!=VK_SAMPLE_COUNT_1_BIT || create.extent.depth!=1 || !bc_features(*d->instance,d->physical,create.format)) { out->memoryRequirements={}; return; }
         const VkFormat original=create.format;
-        create.format=pvb::rgba_format(original); copy.pCreateInfo=&create;
+        create.format=select_backing(*d,create); copy.pCreateInfo=&create;
         if(create.pNext) {
             auto ext=static_cast<const VkBaseInStructure*>(create.pNext);
             if(ext->sType!=VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO || ext->pNext) { out->memoryRequirements={}; return; }
             list=*reinterpret_cast<const VkImageFormatListCreateInfo*>(ext);
-            for(uint32_t n=0;n<list.viewFormatCount;++n) { if(!pvb::compatible_view(original,list.pViewFormats[n])) { out->memoryRequirements={}; return; } formats.push_back(pvb::rgba_format(list.pViewFormats[n])); }
+            for(uint32_t n=0;n<list.viewFormatCount;++n) { if(!pvb::compatible_view(original,list.pViewFormats[n])) { out->memoryRequirements={}; return; } formats.push_back(pvb::is_etc2_backing(create.format)?pvb::etc2_format(list.pViewFormats[n]):pvb::rgba_format(list.pViewFormats[n])); }
             list.pViewFormats=formats.data(); create.pNext=&list;
         }
     }
@@ -538,10 +654,29 @@ VKAPI_ATTR void VKAPI_CALL pvbDestroyPipelineLayout(VkDevice handle,VkPipelineLa
 VKAPI_ATTR void VKAPI_CALL pvbCmdBindPipeline(VkCommandBuffer handle,VkPipelineBindPoint point,VkPipeline pipeline) { auto c=lookup(commands,handle); if(!c) return; c->device->CmdBindPipeline(handle,point,pipeline); if(point==VK_PIPELINE_BIND_POINT_COMPUTE) c->compute=pipeline; }
 VKAPI_ATTR void VKAPI_CALL pvbCmdBindDescriptorSets(VkCommandBuffer handle,VkPipelineBindPoint point,VkPipelineLayout layout,uint32_t first,uint32_t count,const VkDescriptorSet *sets,uint32_t dynamic_count,const uint32_t *offsets) try {
     auto c=lookup(commands,handle); if(!c) return; c->device->CmdBindDescriptorSets(handle,point,layout,first,count,sets,dynamic_count,offsets);
+    if(PVB_COMPACT_HISTORY && point==VK_PIPELINE_BIND_POINT_COMPUTE && !c->binds.empty()) {
+        auto shadow=lookup(layouts,layout); auto &last=c->binds.back();
+        // Identical layout and complete set range: the new binding replaces all
+        // effects of this last descriptor operation, including dynamic offsets.
+        // Never cross a different layout/range: its disturbance must be replayed.
+        if(shadow && shadow==last.layout && first==last.first && count==last.sets.size() && dynamic_count==last.offsets.size()) {
+            if(count) std::copy_n(sets,count,last.sets.begin());
+            if(dynamic_count) std::copy_n(offsets,dynamic_count,last.offsets.begin());
+            return;
+        }
+    }
     if(point==VK_PIPELINE_BIND_POINT_COMPUTE) { DescriptorBind b; b.layout=lookup(layouts,layout); if(!b.layout) { fail(*c,VK_ERROR_UNKNOWN,"Untracked caller pipeline layout"); return; } b.first=first; if(count) b.sets.assign(sets,sets+count); if(dynamic_count) b.offsets.assign(offsets,offsets+dynamic_count); c->binds.push_back(std::move(b)); }
 } catch(const std::bad_alloc&) { auto c=lookup(commands,handle); if(c) fail(*c,VK_ERROR_OUT_OF_HOST_MEMORY,"BC command state capture allocation failed"); }
 VKAPI_ATTR void VKAPI_CALL pvbCmdPushConstants(VkCommandBuffer handle,VkPipelineLayout layout,VkShaderStageFlags stages,uint32_t offset,uint32_t size,const void *data) try {
     auto c=lookup(commands,handle); if(!c) return; c->device->CmdPushConstants(handle,layout,stages,offset,size,data);
+    if(PVB_COMPACT_HISTORY && !c->pushes.empty()) {
+        auto shadow=lookup(layouts,layout); auto &last=c->pushes.back();
+        // Full overwrite of exactly the same stage/byte range only.
+        if(shadow && shadow==last.layout && stages==last.stages && offset==last.offset && size==last.data.size()) {
+            if(size) std::memcpy(last.data.data(),data,size);
+            return;
+        }
+    }
     { Push p; p.layout=lookup(layouts,layout); if(!p.layout) { fail(*c,VK_ERROR_UNKNOWN,"Untracked caller push layout"); return; } p.stages=stages; p.offset=offset; p.data.assign(static_cast<const uint8_t*>(data),static_cast<const uint8_t*>(data)+size); c->pushes.push_back(std::move(p)); }
 } catch(const std::bad_alloc&) { auto c=lookup(commands,handle); if(c) fail(*c,VK_ERROR_OUT_OF_HOST_MEMORY,"BC command state capture allocation failed"); }
 bool retain_store(Command &c,const Image &image) {
@@ -574,49 +709,99 @@ void copy_block_rows(VkCommandBuffer handle,Command &c,const Image &image,VkBuff
     }
 }
 #include "bc_transfer_barriers.inc"
+void replay_state(VkCommandBuffer handle,Command &c) {
+    auto &d=*c.device;
+    // Restore stage-specific compute state. Graphics bindings/constants remain untouched.
+    if(c.compute) d.CmdBindPipeline(handle,VK_PIPELINE_BIND_POINT_COMPUTE,c.compute);
+    perf_binds+=c.binds.size(); perf_pushes+=c.pushes.size();
+    for(const auto &b:c.binds) d.CmdBindDescriptorSets(handle,VK_PIPELINE_BIND_POINT_COMPUTE,b.layout->handle,b.first,uint32_t(b.sets.size()),b.sets.data(),uint32_t(b.offsets.size()),b.offsets.data());
+    for(const auto &p:c.pushes) d.CmdPushConstants(handle,p.layout->handle,p.stages,p.offset,uint32_t(p.data.size()),p.data.data());
+}
+VkResult upload_allocation(Command &c,const pvb::CopyLayout &sizes,Resource &resource,VkDescriptorSet &set,uint64_t &input_offset,uint64_t &output_offset) {
+    auto &d=*c.device;
+    if(PVB_UPLOAD_ARENAS) {
+        const uint64_t alignment=std::max<uint64_t>(16,d.properties.limits.minStorageBufferOffsetAlignment);
+        const auto aligned=[&](uint64_t n) { return (n+alignment-1)/alignment*alignment; };
+        Arena *arena=nullptr; bool created=false;
+        for(auto &a:c.arenas) if(a.sets<64 && aligned(a.input_used)+sizes.input_bytes<=a.input_size && aligned(a.output_used)+sizes.output_bytes<=a.output_size) { arena=&a; break; }
+        if(!arena) {
+            // Reserve ownership before native calls. Arenas are private to this
+            // recording; executable/replayed/pending buffers keep every slot.
+            try { if(c.arenas.size()==c.arenas.capacity()) c.arenas.reserve(c.arenas.empty()?1:c.arenas.size()*2); }
+            catch(const std::bad_alloc&) { return VK_ERROR_OUT_OF_HOST_MEMORY; }
+            Arena a;
+            a.input_size=aligned(std::max<uint64_t>(65536,sizes.input_bytes));
+            a.output_size=aligned(std::max<uint64_t>(262144,sizes.output_bytes));
+            auto guard=rollback([&] { destroy_resource(d,a.backing); });
+            VkResult r=buffer(d,a.input_size,VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,a.backing.input,a.backing.input_memory);
+            if(r==VK_SUCCESS) r=buffer(d,a.output_size,VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,a.backing.output,a.backing.output_memory);
+            VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,128};
+            VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pi.maxSets=64; pi.poolSizeCount=1; pi.pPoolSizes=&ps;
+            if(r==VK_SUCCESS) { ++perf_pools; r=d.CreateDescriptorPool(d.handle,&pi,nullptr,&a.backing.descriptors); }
+            if(r!=VK_SUCCESS) return r;
+            c.arenas.push_back(a); guard.active=false; arena=&c.arenas.back(); created=true;
+        }
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; ai.descriptorPool=arena->backing.descriptors; ai.descriptorSetCount=1; ai.pSetLayouts=&d.descriptors;
+        const auto r=d.AllocateDescriptorSets(d.handle,&ai,&set);
+        if(r!=VK_SUCCESS) {
+            if(created) { destroy_resource(d,arena->backing); c.arenas.pop_back(); }
+            return r;
+        }
+        input_offset=aligned(arena->input_used); output_offset=aligned(arena->output_used);
+        arena->input_used=input_offset+sizes.input_bytes; arena->output_used=output_offset+sizes.output_bytes; ++arena->sets;
+        resource=arena->backing; resource.borrowed=true;
+        return VK_SUCCESS;
+    }
+    VkResult r=buffer(d,sizes.input_bytes,VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,resource.input,resource.input_memory);
+    if(r==VK_SUCCESS) r=buffer(d,sizes.output_bytes,VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,resource.output,resource.output_memory);
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,2}; VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pi.maxSets=1; pi.poolSizeCount=1; pi.pPoolSizes=&ps;
+    if(r==VK_SUCCESS) { ++perf_pools; r=d.CreateDescriptorPool(d.handle,&pi,nullptr,&resource.descriptors); }
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; ai.descriptorPool=resource.descriptors; ai.descriptorSetCount=1; ai.pSetLayouts=&d.descriptors;
+    if(r==VK_SUCCESS) r=d.AllocateDescriptorSets(d.handle,&ai,&set);
+    return r;
+}
 void decode(VkCommandBuffer handle,Command &c,VkBuffer source,VkImage image,VkImageLayout layout,const Image &tracked,const VkBufferImageCopy &region) {
     auto &d=*c.device; pvb::CopyLayout sizes{};
     if(!pvb::copy_layout(tracked.original,region,tracked.extent,tracked.mips,tracked.layers,sizes) || (layout!=VK_IMAGE_LAYOUT_GENERAL && layout!=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) || c.level!=VK_COMMAND_BUFFER_LEVEL_PRIMARY) { fail(c,VK_ERROR_UNKNOWN,"Unsupported BC upload region/layout/secondary buffer"); return; }
-    if(sizes.input_bytes>d.properties.limits.maxStorageBufferRange || sizes.output_bytes>d.properties.limits.maxStorageBufferRange || (region.imageExtent.width+7u)/8u>d.properties.limits.maxComputeWorkGroupCount[0] || (region.imageExtent.height+7u)/8u>d.properties.limits.maxComputeWorkGroupCount[1] || sizes.layers>d.properties.limits.maxComputeWorkGroupCount[2]) { fail(c,VK_ERROR_OUT_OF_DEVICE_MEMORY,"BC decode exceeds storage/dispatch limits"); return; }
+    const bool compressed=pvb::is_etc2_backing(tracked.backing);
+    const auto codec=d.etc2_pipelines[tracked.original>=VK_FORMAT_BC3_UNORM_BLOCK?1:0];
+    const uint32_t dispatch_width=compressed?(region.imageExtent.width+3u)/4u:region.imageExtent.width;
+    const uint32_t dispatch_height=compressed?(region.imageExtent.height+3u)/4u:region.imageExtent.height;
+    if(compressed && !pvb::etc2_output_size(tracked.backing,region.imageExtent.width,region.imageExtent.height,sizes.layers,sizes.output_bytes)) { fail(c,VK_ERROR_OUT_OF_DEVICE_MEMORY,"ETC2 output size overflow"); return; }
+    if(sizes.input_bytes>d.properties.limits.maxStorageBufferRange || sizes.output_bytes>d.properties.limits.maxStorageBufferRange || (dispatch_width+7u)/8u>d.properties.limits.maxComputeWorkGroupCount[0] || (dispatch_height+7u)/8u>d.properties.limits.maxComputeWorkGroupCount[1] || sizes.layers>d.properties.limits.maxComputeWorkGroupCount[2] || (compressed&&!codec)) { fail(c,VK_ERROR_OUT_OF_DEVICE_MEMORY,"BC decode exceeds storage/dispatch limits or native pipeline unavailable"); return; }
     // Reserve ownership before any native allocation or GPU command: append cannot throw later.
     try { if(c.resources.size()==c.resources.capacity()) c.resources.reserve(c.resources.empty()?1:c.resources.size()*2); }
     catch(const std::bad_alloc&) { fail(c,VK_ERROR_OUT_OF_HOST_MEMORY,"BC resource ownership allocation failed"); return; }
     if(!retain_store(c,tracked)) return;
     if(!(tracked.usage&VK_IMAGE_USAGE_TRANSFER_DST_BIT)) { fail(c,VK_ERROR_UNKNOWN,"BC upload requires transfer-destination usage"); return; }
     Resource resource{};
-    VkResult r=buffer(d,sizes.input_bytes,VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,resource.input,resource.input_memory);
-    if(r==VK_SUCCESS) r=buffer(d,sizes.output_bytes,VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,resource.output,resource.output_memory);
-    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,2}; VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool_info.maxSets=1; pool_info.poolSizeCount=1; pool_info.pPoolSizes=&pool_size;
-    if(r==VK_SUCCESS) r=d.CreateDescriptorPool(d.handle,&pool_info,nullptr,&resource.descriptors);
-    VkDescriptorSet set=VK_NULL_HANDLE; VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocate.descriptorPool=resource.descriptors; allocate.descriptorSetCount=1; allocate.pSetLayouts=&d.descriptors;
-    if(r==VK_SUCCESS) r=d.AllocateDescriptorSets(d.handle,&allocate,&set);
+    VkDescriptorSet set=VK_NULL_HANDLE; uint64_t input_offset=0,output_offset=0;
+    VkResult r=upload_allocation(c,sizes,resource,set,input_offset,output_offset);
     if(r!=VK_SUCCESS) { destroy_resource(d,resource); fail(c,r,"BC upload allocation failed"); return; }
-    VkDescriptorBufferInfo buffers[2]={{resource.input,0,sizes.input_bytes},{resource.output,0,sizes.output_bytes}}; VkWriteDescriptorSet writes[2]{};
+    VkDescriptorBufferInfo buffers[2]={{resource.input,input_offset,sizes.input_bytes},{resource.output,output_offset,sizes.output_bytes}}; VkWriteDescriptorSet writes[2]{};
     for(uint32_t n=0;n<2;++n) { writes[n].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[n].dstSet=set; writes[n].dstBinding=n; writes[n].descriptorCount=1; writes[n].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[n].pBufferInfo=&buffers[n]; }
     d.UpdateDescriptorSets(d.handle,2,writes,0,nullptr);
     // Preserve the caller's compressed bytes, including selector bits that have
     // no unique inverse in the decoded RGBA image. Buffer pitch padding is not
     // image content and is deliberately excluded from the canonical store.
     if(tracked.blocks) copy_block_rows(handle,c,tracked,source,region,sizes,true);
-    VkBufferCopy copy{region.bufferOffset,0,sizes.input_bytes}; d.CmdCopyBuffer(handle,source,resource.input,1,&copy);
-    VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER}; barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; barrier.dstAccessMask=VK_ACCESS_SHADER_READ_BIT; barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; barrier.buffer=resource.input; barrier.size=VK_WHOLE_SIZE;
+    VkBufferCopy copy{region.bufferOffset,input_offset,sizes.input_bytes}; d.CmdCopyBuffer(handle,source,resource.input,1,&copy);
+    VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER}; barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; barrier.dstAccessMask=VK_ACCESS_SHADER_READ_BIT; barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; barrier.buffer=resource.input; barrier.offset=input_offset; barrier.size=sizes.input_bytes;
     d.CmdPipelineBarrier(handle,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,0,nullptr,1,&barrier,0,nullptr);
     const uint32_t push[6]={uint32_t(tracked.original),region.imageExtent.width,region.imageExtent.height,sizes.layers,sizes.blocks_row,sizes.blocks_height};
-    d.CmdBindPipeline(handle,VK_PIPELINE_BIND_POINT_COMPUTE,d.pipeline); d.CmdBindDescriptorSets(handle,VK_PIPELINE_BIND_POINT_COMPUTE,d.layout,0,1,&set,0,nullptr); d.CmdPushConstants(handle,d.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),push);
-    d.CmdDispatch(handle,(region.imageExtent.width+7u)/8u,(region.imageExtent.height+7u)/8u,sizes.layers);
+    d.CmdBindPipeline(handle,VK_PIPELINE_BIND_POINT_COMPUTE,compressed?codec:d.pipeline); d.CmdBindDescriptorSets(handle,VK_PIPELINE_BIND_POINT_COMPUTE,d.layout,0,1,&set,0,nullptr); d.CmdPushConstants(handle,d.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),push);
+    d.CmdDispatch(handle,(dispatch_width+7u)/8u,(dispatch_height+7u)/8u,sizes.layers);
+    if(compressed) ++etc2_dispatches; else ++rgba_dispatches;
 #ifdef __ANDROID__
     if(dispatches.fetch_add(1)==0) __android_log_print(ANDROID_LOG_INFO,"PixelBC","First GPU BC decode recorded: format=%u extent=%ux%u layers=%u",uint32_t(tracked.original),region.imageExtent.width,region.imageExtent.height,sizes.layers);
 #else
     ++dispatches;
 #endif
-    barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT; barrier.buffer=resource.output;
+    barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT; barrier.buffer=resource.output; barrier.offset=output_offset; barrier.size=sizes.output_bytes;
     d.CmdPipelineBarrier(handle,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,1,&barrier,0,nullptr);
-    VkBufferImageCopy destination=region; destination.bufferOffset=0; destination.bufferRowLength=0; destination.bufferImageHeight=0;
+    VkBufferImageCopy destination=region; destination.bufferOffset=output_offset; destination.bufferRowLength=0; destination.bufferImageHeight=0;
     d.CmdCopyBufferToImage(handle,resource.output,image,layout,1,&destination);
-    // Restore stage-specific compute state. Graphics bindings/constants remain untouched.
-    if(c.compute) d.CmdBindPipeline(handle,VK_PIPELINE_BIND_POINT_COMPUTE,c.compute);
-    for(const auto &b:c.binds) d.CmdBindDescriptorSets(handle,VK_PIPELINE_BIND_POINT_COMPUTE,b.layout->handle,b.first,uint32_t(b.sets.size()),b.sets.data(),uint32_t(b.offsets.size()),b.offsets.data());
-    for(const auto &p:c.pushes) d.CmdPushConstants(handle,p.layout->handle,p.stages,p.offset,uint32_t(p.data.size()),p.data.data());
+    replay_state(handle,c);
     c.resources.push_back(resource); ++live_resources;
 }
 VKAPI_ATTR void VKAPI_CALL pvbCmdCopyBufferToImage(VkCommandBuffer handle,VkBuffer source,VkImage image,VkImageLayout layout,uint32_t count,const VkBufferImageCopy *regions) {
@@ -674,6 +859,19 @@ VKAPI_ATTR void VKAPI_CALL pvbCmdCopyImage(VkCommandBuffer handle,VkImage source
         pvb::CopyLayout sl{},dl{};
         if(r.srcSubresource.layerCount!=r.dstSubresource.layerCount || !pvb::copy_layout(src.original,sr,src.extent,src.mips,src.layers,sl) || !pvb::copy_layout(dst.original,dr,dst.extent,dst.mips,dst.layers,dl)) { fail(*c,VK_ERROR_UNKNOWN,"Unsupported BC image-copy region"); return; }
         if(!retain_store(*c,src) || !retain_store(*c,dst)) return;
+        if(pvb::is_etc2_backing(src.backing)!=pvb::is_etc2_backing(dst.backing)) {
+            // Native RGBA↔ETC2 image copies would reinterpret incompatible
+            // blocks. Regenerate the destination from byte-faithful BC storage
+            // via transfer staging, preserving the caller's transfer-stage
+            // synchronization semantics and avoiding repeated lossy encoding.
+            const auto &sm=src.blocks->mips[r.srcSubresource.mipLevel];
+            dr.bufferOffset=block_offset(src,sr,0,0);
+            dr.bufferRowLength=sm.blocks_row*4u; dr.bufferImageHeight=sm.blocks_height*4u;
+            decode(handle,*c,src.blocks->buffer,destination,destination_layout,dst,dr);
+            ++cross_backing_regenerations;
+            if(c->error!=VK_SUCCESS) return;
+            continue;
+        }
         if(dst.blocks) {
             const auto row_bytes=((uint64_t(r.extent.width)+3)/4)*pvb::block_bytes(src.original);
             const auto &sm=src.blocks->mips[r.srcSubresource.mipLevel],&dm=dst.blocks->mips[r.dstSubresource.mipLevel];
@@ -752,8 +950,29 @@ extern "C" EXPORT void pvb_get_stats(PvbStats *out) {
     out->version=1; out->decode_dispatches=dispatches.load(); out->recording_failures=failures.load(); out->live_upload_resources=live_resources.load(); out->backend_recursion_rejections=backend_recursion.load(); std::snprintf(out->backend,sizeof(out->backend),"%s",backend.path.c_str());
 }
 extern "C" EXPORT const char *pvb_get_version() { return PVB_VERSION; }
+extern "C" EXPORT void pvb_get_perf_stats(PvbPerfStats *out) {
+    if(out) *out={1,perf_buffers.load(),perf_memory.load(),perf_pools.load(),perf_bytes.load(),perf_binds.load(),perf_pushes.load()};
+}
 extern "C" EXPORT void pvb_get_transfer_stats(PvbTransferStats *out) {
     if(out) *out={1,live_block_stores.load(),live_block_bytes.load(),block_copy_bytes.load()};
+}
+extern "C" EXPORT void pvb_get_compression_stats(PvbCompressionStats *out) {
+    if(!out) return;
+    *out={}; out->version=1;
+    out->etc2_upload_dispatches=etc2_dispatches.load(); out->rgba_upload_dispatches=rgba_dispatches.load();
+    out->cross_backing_regenerations=cross_backing_regenerations.load();
+    std::lock_guard<std::mutex> lock(maps_mutex);
+    for(const auto &d:devices) out->native_etc2_devices+=d.second->native_etc2;
+    for(const auto &entry:images) {
+        const auto &im=entry.second; const bool compressed=pvb::is_etc2_backing(im.backing);
+        if(compressed) ++out->live_etc2_images; else ++out->live_rgba_images;
+        uint64_t bytes=0;
+        for(uint32_t mip=0;mip<im.mips;++mip) {
+            const uint64_t w=std::max(1u,im.extent.width>>std::min(mip,31u)),h=std::max(1u,im.extent.height>>std::min(mip,31u));
+            bytes+=compressed?((w+3)/4)*((h+3)/4)*im.layers*pvb::etc2_block_bytes(im.backing):w*h*im.layers*4;
+        }
+        if(compressed) out->live_etc2_logical_bytes+=bytes; else out->live_rgba_logical_bytes+=bytes;
+    }
 }
 #ifdef __ANDROID__
 namespace {

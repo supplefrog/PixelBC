@@ -1,3 +1,6 @@
-work/
-outputs/
+/work/
+/outputs/
+/build/
+/build-*/
 __pycache__/
+*.pyc

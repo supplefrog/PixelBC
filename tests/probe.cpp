@@ -209,13 +209,13 @@ struct DiagnosticResources:DiagnosticHandles {
 VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,VkDebugUtilsMessageTypeFlagsEXT,const VkDebugUtilsMessengerCallbackDataEXT *data,void*) {
     if(severity&VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) { ++validation_errors; std::fprintf(stderr,"VALIDATION: %s\n",data->pMessage); } return VK_FALSE;
 }
-void init(App &a,const char *path,bool validation) {
+void init(App &a,const char *path,bool validation,bool enforce_version=true) {
     std::printf("PROBE_VERSION: %s\nLIBRARY_REQUESTED: %s\nCHAR_SIGNED: %d\n",PVB_VERSION,path,char(-1)<0);
     stage("before wrapper dlopen");
     a.library=dlopen(path,RTLD_NOW|RTLD_LOCAL); if(!a.library) throw std::runtime_error(dlerror());
     stage("after wrapper dlopen");
     auto version=reinterpret_cast<PvbGetVersion>(dlsym(a.library,"pvb_get_version"));
-    if(!version || std::strcmp(version(),PVB_VERSION)) throw std::runtime_error("Probe/library version mismatch");
+    if(!version || (enforce_version && std::strcmp(version(),PVB_VERSION))) throw std::runtime_error("Probe/library version mismatch");
     Dl_info origin{}; if(dladdr(reinterpret_cast<void*>(version),&origin)) std::printf("LIBRARY_LOADED: %s\n",origin.dli_fname);
     std::printf("LIBRARY_VERSION: %s\n",version());
     a.stats=reinterpret_cast<PvbGetStats>(dlsym(a.library,"pvb_get_stats")); if(!a.stats) throw std::runtime_error("Not PixelBC (missing proof counters)");

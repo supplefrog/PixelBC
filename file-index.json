@@ -1,0 +1,451 @@
+{
+  "files": {
+    ".gitignore": {
+      "bytes": 54,
+      "mode": "100644",
+      "origin": "public-documentation",
+      "sha256": "e89b3d0761029d64dc223cfbab9865d0fbe6d7e1c46125cde0ef637ad01722da"
+    },
+    "CMakeLists.txt": {
+      "bytes": 18543,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "d879fc4abc3cf1a99b0a70d968d3d9963990bf5b5c0da8e75fde0da209eae50d"
+    },
+    "HANDOFF.md": {
+      "bytes": 3273,
+      "mode": "100644",
+      "origin": "public-documentation",
+      "sha256": "05c73f8477f8dfcbdfb75976bcf235f18b6277641ccbb3005cff4f05dae893c7"
+    },
+    "LICENSE": {
+      "bytes": 1090,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "51738e777eb9422a29fba0d96ef47faf3d183a3a90530b473e6066b1096812d5"
+    },
+    "README.md": {
+      "bytes": 5429,
+      "mode": "100644",
+      "origin": "public-documentation",
+      "sha256": "e9551023e49965d14be38fcaa6cc7f63fd31d546762845f498dc5a6cd0f420f8"
+    },
+    "docs/ARCHITECTURE.md": {
+      "bytes": 2994,
+      "mode": "100644",
+      "origin": "public-documentation",
+      "sha256": "7211fc6e15507104a415d85832df9d57461112afd8cb8799043a2da7e164288a"
+    },
+    "docs/BC_TRANSFER_INTERNAL.md": {
+      "bytes": 1680,
+      "mode": "100644",
+      "origin": "public-documentation",
+      "sha256": "12179bd135b0875b3c83c4fd5abeb459f056ae34113062b1a439966bcb60b44f"
+    },
+    "docs/ETC2_ENCODER.md": {
+      "bytes": 1596,
+      "mode": "100644",
+      "origin": "public-documentation",
+      "sha256": "0e209ee635bd5af9d699e7497ee6dac3c5499a023b648c27240b8452139b07fc"
+    },
+    "docs/ETC2_ENCODER_BOUNDED.md": {
+      "bytes": 1259,
+      "mode": "100644",
+      "origin": "public-documentation",
+      "sha256": "5e985db1cebd1fccc64f5ada28b567fdd6bc36d4a742e1c3148528cd08756323"
+    },
+    "docs/THIRD_PARTY.md": {
+      "bytes": 5043,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "3d607e365164bf729fbf974530cdf43da70f02a287d68381fabeed3172846e6a"
+    },
+    "docs/VALIDATION.md": {
+      "bytes": 4524,
+      "mode": "100644",
+      "origin": "public-documentation",
+      "sha256": "5059bfdcf7761a062e5922983b0cbca79da249cdd8b6a327bc3391739dbfdbe2"
+    },
+    "licenses/Apache-2.0.txt": {
+      "bytes": 11345,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "1354bfa2779bf93121f4c9bd73d458726bba8f02249fd356105d433c262a691e"
+    },
+    "licenses/NDK-R30-runtime-NOTICE.txt": {
+      "bytes": 130424,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "f96f763beb66a7ba7a667647fc64c0226ace875e590c831fdd9579ec1c1d91e1"
+    },
+    "licenses/bcdec-MIT.txt": {
+      "bytes": 1057,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "3163e54d0e4a8e32be7756ab26ba90f6730647c87b328fa6367dc909ca9ef325"
+    },
+    "licenses/detex-ISC.txt": {
+      "bytes": 753,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "9cc15d320ace19a4a71a1fa1ddcdd5f888cd45377d117ddbc51ff5fa8901e6f7"
+    },
+    "licenses/etc2_encode-MIT.txt": {
+      "bytes": 1064,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "b9dfcfd868c41ef7f899de1390fc2bbded1f9c67ebdb3096b63899a6e4cc0b44"
+    },
+    "scripts/build_android.sh": {
+      "bytes": 924,
+      "mode": "100755",
+      "origin": "tested-0.1.9",
+      "sha256": "f61c02ce99beb2407f43d379c9faf4a71a669c62c40d1d2ae7ca32b5b516eb59"
+    },
+    "scripts/compare_benchmarks.py": {
+      "bytes": 4025,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "e35b61f94229803aab26204bc9ee7b18db16eba65e8098868dbf170077718f0b"
+    },
+    "scripts/embed_spirv.py": {
+      "bytes": 624,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "bcd15b3ddbfffe38274a8c724dd1838b1747a304180e27352d740a0cdd7a5ac3"
+    },
+    "scripts/etc2_alpha_bound.py": {
+      "bytes": 2551,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "50d5ffdb70750d4b93f562814ecfbd1e5430df66cad8fe83412018f4dbc02999"
+    },
+    "scripts/etc2_alpha_regressions.py": {
+      "bytes": 3558,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "604becf1273f7c18fec69ff2b951066c5ee6069ce06359dfe2dd6ebe3df50490"
+    },
+    "scripts/mutate_etc2_encoder.py": {
+      "bytes": 1293,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "bb69d2ad64475b64b921e1db9b7226019936897e480adf247f4470817cdf1489"
+    },
+    "scripts/package.py": {
+      "bytes": 6940,
+      "mode": "100755",
+      "origin": "tested-0.1.9",
+      "sha256": "95a95e8638aec13739cf608857a92f8e465be388a1fb3541c001aaf66a36e46d"
+    },
+    "scripts/source_bundle.py": {
+      "bytes": 3071,
+      "mode": "100755",
+      "origin": "tested-0.1.9",
+      "sha256": "8378022ec5e2b4e06b4fc5a9870a4724435e9692b0a6a21e07a969c493367ac5"
+    },
+    "scripts/test_host.sh": {
+      "bytes": 784,
+      "mode": "100755",
+      "origin": "tested-0.1.9",
+      "sha256": "7b1eff7059d2b56c984b0fc02097280417d7245dbc6371169887da0894eeb192"
+    },
+    "scripts/test_optimization_controls.py": {
+      "bytes": 4300,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "6d0a9b97659b51ed53477f15ffa51c957ea1a0858e34fc8c5fba9874921256b8"
+    },
+    "scripts/version.py": {
+      "bytes": 426,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "bd48850a393173b8578bf0a745a58ba6bfcc342305bc015f760ecd6a714f122b"
+    },
+    "sources.lock.json": {
+      "bytes": 1484,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "07f2b16d67cc5024101f167616c61e4b1785eedda42f323c661e2aa98acc2564"
+    },
+    "src/android_hal.h": {
+      "bytes": 1842,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "63fec488d63f70d006fcb25c1741bc4cc3527311788c28088aa6d09109a5daf8"
+    },
+    "src/bc_decode.comp": {
+      "bytes": 13186,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "3359ca3fe4e4f7b8b3bdf88d5b665ab73fc90fa0fd257c76249903fd548d083f"
+    },
+    "src/bc_decode_shared.comp": {
+      "bytes": 16027,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "da8455096a168432cf1cc06a6c6be40faef2f0667bb86b4d07901f53446a0a81"
+    },
+    "src/bc_etc2_encode.comp": {
+      "bytes": 32224,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "2e1443e8487fea9537a12c6f89335b7ab06416e2da1dc70170c7bda320e44ae0"
+    },
+    "src/bc_etc2_encode_weighted_reference.comp": {
+      "bytes": 17521,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "02ede877a4205a5c145f90fc67f2db357b82409b8d70d4c036ad5875146d5ac5"
+    },
+    "src/bc_layout.h": {
+      "bytes": 4614,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "d2473d5986cd3e0035daee33aabdbd32d02f80d1384aea42c37f3fdfea36a8bf"
+    },
+    "src/bc_transfer_barriers.inc": {
+      "bytes": 8005,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "fdb3d46fd91f63f859caf16051198a4424dc7480918771e6a4f2a9288c8a7d1d"
+    },
+    "src/bc_transfer_layout.h": {
+      "bytes": 1183,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "ef9bda97f17e40e417672083fe12c35ba0493bfd04db8d81b560b4a2fb0bf197"
+    },
+    "src/compression_stats.h": {
+      "bytes": 589,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "2c440af3c814a87f31a5ef3bdae593c74fd134c5b1d9deb9f2ccd406fffb6c14"
+    },
+    "src/etc2_formats.h": {
+      "bytes": 1477,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "f48d43282ff4c9ea332c96f1b794542911b1754431aef491eb4e37e4425b5ad4"
+    },
+    "src/exports.map": {
+      "bytes": 183,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "4ca26b58f30752f6aad96342e5c7b5c04a43a8f8d8385135622976632a8887ec"
+    },
+    "src/perf_stats.h": {
+      "bytes": 392,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "75ed4649d5bd0c0209af576f88e4c1d97182c3e14a0d4883ace7216979f881fc"
+    },
+    "src/stats.h": {
+      "bytes": 317,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "227a1687c3adddd8b52417da3b533f8b7361d1bb6e4606ed079ce9b4f03193d2"
+    },
+    "src/transfer_stats.h": {
+      "bytes": 320,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "44dd8bbf62768f4f4dc6bd6f5e98af48db5848598e0c87c0b0f7a8395e2017ae"
+    },
+    "src/wrapper.cpp": {
+      "bytes": 80584,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "5687b851ee01a32056b4e7e75f3cb4b304e82e995769ef5d23b940bf5cb59278"
+    },
+    "tests/android_backend_lifetime.cpp": {
+      "bytes": 3830,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "53ae49e91dac092f19f804b8fd9372d4cfd38b9afaed8580b84288afdc616fbd"
+    },
+    "tests/android_shim/android/log.h": {
+      "bytes": 178,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "a4dc7c625fdfab93096a2a7833539f62e0c8e92137f1499fe079ca735a5c1920"
+    },
+    "tests/bc7_cube_sample.comp": {
+      "bytes": 1290,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "efe8cb0fb889e6fdd2b7575f4eb09ddc333017fff5cfaf0d94ec9eeee3533fc6"
+    },
+    "tests/bc7_probe.cpp": {
+      "bytes": 26250,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "b9ce11f95fd5d15a73c19229244672f73fda6861187540dbf9ffffb3a782f489"
+    },
+    "tests/benchmark.cpp": {
+      "bytes": 16497,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "cb4c4b6d31cd365fe0f52c3d9c9d868260c05ca4d9fd76b6806448d6a6e38864"
+    },
+    "tests/diagnostic_failures.cpp": {
+      "bytes": 13503,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "7b2471d7af05e15ea62b77eb4682b66c94a9849a5cbaf600228cd7d5411a362a"
+    },
+    "tests/etc2_adversarial.h": {
+      "bytes": 3162,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "5d6683c903484221fa7f418bbfd6ae58d5075a50ca9ff6865e3d0de96245b1a5"
+    },
+    "tests/etc2_alpha_mask.h": {
+      "bytes": 4287,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "7c7075f198104236fc6bc977982048793aaca3e9276ff2f281e9c8e9247e1f55"
+    },
+    "tests/etc2_alpha_regression.cpp": {
+      "bytes": 4804,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "c87fe4ac55584481124f2aea373fe2bd793280ffd0b55c41fce54299e8eaba1e"
+    },
+    "tests/etc2_contracts.cpp": {
+      "bytes": 12579,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "5f27a46f1f507d4f832f6c4c0968cd99aa17198c679666459b35b9546455dabf"
+    },
+    "tests/etc2_encoder_cache.cpp": {
+      "bytes": 6478,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "651256d62affbe770a016313824e7b21e40791729d69a1d5c81d9cf300e45a77"
+    },
+    "tests/etc2_kernel_compare.cpp": {
+      "bytes": 15085,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "49ad6df931f4e77107179d9efdd98273f319ea8e30a5fe99d118c2622d4602a6"
+    },
+    "tests/etc2_linear_sample.comp": {
+      "bytes": 1072,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "43c06c1395584f07f0ca6546a19b189a79d8c5daac4ed5e0feed0f52b3f55aaa"
+    },
+    "tests/etc2_probe.cpp": {
+      "bytes": 100032,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "f945f010a2ab519cad01d5d19468fa045027080099a41093fbda6553165a98a3"
+    },
+    "tests/lifecycle_backend.cpp": {
+      "bytes": 1144,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "2cbe250e190f71f9601bb32be470b42ea2205485fa6e07d5830c89945e213385"
+    },
+    "tests/optimization_ownership.cpp": {
+      "bytes": 14884,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "bbeaab9a43a505b82fb741d8bf8a27929be9366497485eaff8dc1d7c5fb47ad9"
+    },
+    "tests/oracle/detex/LICENSE": {
+      "bytes": 754,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "226c3e9c2b76a872d4e90733ac0293cf4bd66ffbddf654c69ace09e4ec89e341"
+    },
+    "tests/oracle/detex/clamp.c": {
+      "bytes": 4183,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "0bd2f31ad599bb05637d7481985986818fa71448005b730b34fb17767e8a62d4"
+    },
+    "tests/oracle/detex/decompress-eac.c": {
+      "bytes": 10797,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "3ce53076e7eb85d7eecfa83a5971f19eefe60d64fd76032a1c8e123793aa13b8"
+    },
+    "tests/oracle/detex/decompress-etc.c": {
+      "bytes": 31763,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "99c7f62ec5ca5b4dab54dbb984a5649f552827160332dbbf5a60ff7259fd7988"
+    },
+    "tests/oracle/detex/detex.h": {
+      "bytes": 44266,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "4621b899b0efcdfa53b8776110016e6b21e43c15936f3446f46b6889d735a48b"
+    },
+    "tests/oracle/detex/provenance.json": {
+      "bytes": 833,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "8c8cb49bd8f6851dd3989e23403ca2f4c4213eb7e488f49ddb47c4a25ea3b03f"
+    },
+    "tests/ownership_failures.cpp": {
+      "bytes": 8026,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "92a772231596b54650f6fbbe72fd8e4aae8607ff087561d52fb18d2b8899f81a"
+    },
+    "tests/probe.cpp": {
+      "bytes": 73326,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "0ef1dbf600f1eacb96fa8916769a768f1046d550b4bbea79f634dcadc91d4bd4"
+    },
+    "tests/probe_lifecycle.cpp": {
+      "bytes": 2859,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "b8bae86f1eb794aff9499dc0c58f894dec1f626896f380d9f478ddac11b9f66e"
+    },
+    "tests/reference_bcdec.h": {
+      "bytes": 79835,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "bc4144bb35e59db8ebe0c061daebadd50eb74eff3812df8d054a210e7fbb647d"
+    },
+    "tests/reference_portability.cpp": {
+      "bytes": 2989,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "3fec4f595b5509734f250a4b2d83e006ee402c7164dd4ae9ffca740a0f076cc5"
+    },
+    "tests/sample.comp": {
+      "bytes": 957,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "1eea0fd0bd9aa7a1df51da22052c16061d9c088936d8bb1d1cee8b22de5df6f4"
+    },
+    "tests/shape_policy_probe.cpp": {
+      "bytes": 17677,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "793128bffb4461d22b3bfa365fb1e8951644c559c2d288b5bf07b637911982f8"
+    },
+    "tests/transfer_ownership.cpp": {
+      "bytes": 10629,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "70f901dafa88b68f839c9aae86bec3860d5a03f7bc900a251aae7cdc88f3b779"
+    },
+    "tests/transfer_probe.inc": {
+      "bytes": 23109,
+      "mode": "100644",
+      "origin": "tested-0.1.9",
+      "sha256": "c0c2ea2138e197294c73b9b46e6d77377a172df113073f853080c4ecb3957ae2"
+    }
+  },
+  "schema": 1,
+  "self_indexed": false,
+  "version": "0.1.9"
+}

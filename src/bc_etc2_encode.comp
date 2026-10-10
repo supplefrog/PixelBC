@@ -1,0 +1,633 @@
+#version 450
+// SPDX-License-Identifier: MIT AND ISC AND Apache-2.0
+// Altered GPU RGB encoder adapted from Leegao/etc2_encode, Copyright (c) 2026 Lee Gao.
+// Pinned a32883c1f5f66358403060e1f180714ee241dae6; licenses/etc2_encode-MIT.txt.
+// EAC modifier table adapted from detex, Copyright (c) 2015 Harm Hanemaaijer.
+// Pinned cab11584d9be140602a66fd9a88ef0b99f08a97a; licenses/detex-ISC.txt.
+// Altered bounded mean/range fitting draws on Basis Universal 2.5,
+// Copyright (C) 2019-2026 Binomial LLC, Apache-2.0.
+// Pinned 99f52d63aa6799cbdaecfe977111dc5ec3b31d47; licenses/Apache-2.0.txt.
+// BC helpers follow the existing lossless decoder. This shader deliberately recompresses.
+// Original sRGB bytes are fitted directly; ETC2_SRGB sampling performs the gamma conversion.
+#if defined(PVB_ETC_BC1_ONLY) && defined(PVB_ETC_BC3_ONLY)
+#error Select exactly one production BC format family.
+#endif
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+layout(set=0,binding=0,std430) readonly buffer Input { uint words[]; } src;
+layout(set=0,binding=1,std430) writeonly buffer Output { uint words[]; } dst;
+layout(push_constant) uniform Params { uint format, width, height, layers, blocksRow, blocksHeight; } pc;
+
+const ivec4 rgbModifiers[8]=ivec4[8](
+    ivec4(2,8,-2,-8), ivec4(5,17,-5,-17), ivec4(9,29,-9,-29), ivec4(13,42,-13,-42),
+    ivec4(18,60,-18,-60), ivec4(24,80,-24,-80), ivec4(33,106,-33,-106), ivec4(47,183,-47,-183));
+const int distances[8]=int[8](3,6,11,16,23,32,41,64);
+const int alphaModifiers[128]=int[128](
+    -3,-6,-9,-15,2,5,8,14, -3,-7,-10,-13,2,6,9,12,
+    -2,-5,-8,-13,1,4,7,12, -2,-4,-6,-13,1,3,5,12,
+    -3,-6,-8,-12,2,5,7,11, -3,-7,-9,-11,2,6,8,10,
+    -4,-7,-8,-11,3,6,7,10, -3,-5,-8,-11,2,4,7,10,
+    -2,-6,-8,-10,1,5,7,9, -2,-5,-8,-10,1,4,7,9,
+    -2,-4,-8,-10,1,3,7,9, -2,-5,-7,-10,1,4,6,9,
+    -3,-4,-7,-10,2,3,6,9, -1,-2,-3,-10,0,1,2,9,
+    -4,-6,-8,-9,3,5,7,8, -3,-5,-7,-9,2,4,6,8);
+
+uint byteSwap(uint v) {
+    return ((v&255u)<<24u)|((v&65280u)<<8u)|((v>>8u)&65280u)|(v>>24u);
+}
+uint bcIndex3(uvec2 b,uint p) {
+    uint bit=16u+p*3u;
+    if(bit<30u) return (b.x>>bit)&7u;
+    if(bit>=32u) return (b.y>>(bit-32u))&7u;
+    return ((b.x>>31u)|(b.y<<1u))&7u;
+}
+uint bcAlpha(uvec2 b,uint p) {
+    uint a=b.x&255u,z=(b.x>>8u)&255u,i=bcIndex3(b,p);
+    if(i==0u) return a;
+    if(i==1u) return z;
+    if(a<=z && i>=6u) return i==6u ? 0u : 255u;
+    uint denominator=a>z ? 7u : 5u,n=i-1u;
+    return ((denominator-n)*a+n*z+denominator/2u)/denominator;
+}
+// The independent source decoder truncates interpolants. Use that visibility
+// classification for the RGB error bound; a positive 6/7 alpha rounds to one
+// internally but must not enlarge the independently visible sample count.
+uint bcAlphaFloor(uvec2 b,uint p) {
+    uint a=b.x&255u,z=(b.x>>8u)&255u,i=bcIndex3(b,p);
+    if(i==0u) return a;
+    if(i==1u) return z;
+    if(a<=z && i>=6u) return i==6u ? 0u : 255u;
+    uint denominator=a>z ? 7u : 5u,n=i-1u;
+    return ((denominator-n)*a+n*z)/denominator;
+}
+uvec3 expand565(uint c) {
+    return uvec3(((c>>11u)&31u)*255u+15u,((c>>5u)&63u)*255u+31u,(c&31u)*255u+15u)/uvec3(31u,63u,31u);
+}
+uvec4 bcColor(uvec2 b,uint p,bool force4,bool opaqueRgb) {
+    uint c0=b.x&65535u,c1=b.x>>16u,i=(b.y>>(2u*p))&3u;
+    uvec3 a=expand565(c0),z=expand565(c1),result;
+    if(i==0u) result=a;
+    else if(i==1u) result=z;
+    else if(c0>c1 || force4) result=(i==2u ? 2u*a+z : a+2u*z)/3u;
+    else if(i==2u) result=(a+z)/2u;
+    else return uvec4(0,0,0,opaqueRgb ? 255u : 0u);
+    return uvec4(result,255u);
+}
+ivec3 quantize(ivec3 c,int bits) {
+    int limit=(1<<bits)-1;
+    return clamp((c*limit+127)/255,ivec3(0),ivec3(limit));
+}
+ivec3 expandBase(ivec3 q,int bits) { return bits==4 ? q*17 : ((q<<3)|(q>>2)); }
+uint rgbError(ivec3 a,ivec3 b) { ivec3 d=a-b; return uint(d.x*d.x+d.y*d.y+d.z*d.z); }
+uint selectorBit(uint p,uint s) {
+    uint bit=(p%4u)*4u+p/4u;
+    return ((s&1u)<<bit)|((s>>1u)<<(bit+16u));
+}
+bool inHalf(uint p,uint flip,uint region) { return (flip==0u ? p%4u/2u : p/8u)==region; }
+// Values are ordered by their first texel occurrence, preserving seed ties.
+// Packed row-major source indices also represent clamped edge texels.
+struct ColorSource {
+    ivec3 values[4]; uint count; uint indices; uint visibleTexels;
+    uvec4 weights; uvec4 halfWeights[4];
+};
+#ifndef PVB_ETC_BC1_ONLY
+#ifdef PVB_ETC_BC3_ONLY
+#define PVB_ALPHA_VALUES 8
+#else
+#define PVB_ALPHA_VALUES 16
+#endif
+struct AlphaSource {
+    int values[PVB_ALPHA_VALUES]; uint weights[PVB_ALPHA_VALUES]; uint count; uvec2 indices; int texels;
+};
+#endif
+struct Fit { ivec3 q; uint table; uint error; };
+
+// Same candidate order and refinement as the frozen encoder. Integer weights
+// replace repeated equal texels; actual decoded palette values are clamped once.
+Fit fitHalf(ColorSource colors,uint flip,uint region,int bits) {
+    uvec4 weights=colors.halfWeights[flip*2u+region];
+    ivec3 sum=ivec3(0); int count=0;
+    for(uint i=0u;i<colors.count;++i) { sum+=colors.values[i]*int(weights[i]); count+=int(weights[i]); }
+    ivec3 mean=count==0 ? colors.values[0] : (sum+count/2)/count;
+    Fit best; best.q=quantize(mean,bits); best.table=0u; best.error=0xffffffffu;
+    for(uint t=0u;t<8u;++t) {
+        ivec3 q=quantize(mean,bits);
+        for(uint trial=0u;trial<2u;++trial) {
+            ivec3 base=expandBase(q,bits),deltaSum=ivec3(0),palette[4];
+            for(uint k=0u;k<4u;++k) palette[k]=clamp(base+rgbModifiers[t][k],ivec3(0),ivec3(255));
+            uint error=0u;
+            for(uint i=0u;i<colors.count;++i) if(weights[i]!=0u) {
+                uint lowest=0xffffffffu; ivec3 chosenColor=ivec3(0);
+                for(uint k=0u;k<4u;++k) {
+                    uint e=rgbError(colors.values[i],palette[k]);
+                    if(e<lowest) { lowest=e; chosenColor=palette[k]; }
+                }
+                error+=lowest*weights[i]; deltaSum+=(chosenColor-base)*int(weights[i]);
+            }
+            if(error<best.error) { best.q=q; best.table=t; best.error=error; }
+            if(count==0) break;
+            ivec3 next=quantize(ivec3(floor(vec3(sum-deltaSum)/float(count)+0.5)),bits);
+            if(all(equal(next,q))) break;
+            q=next;
+        }
+    }
+    return best;
+}
+uvec4 halfSelectors(ColorSource colors,Fit fit,int bits) {
+    ivec3 base=expandBase(fit.q,bits),palette[4]; uvec4 result=uvec4(0u);
+    for(uint k=0u;k<4u;++k) palette[k]=clamp(base+rgbModifiers[fit.table][k],ivec3(0),ivec3(255));
+    for(uint i=0u;i<colors.count;++i) {
+        uint lowest=0xffffffffu;
+        for(uint k=0u;k<4u;++k) {
+            uint e=rgbError(colors.values[i],palette[k]);
+            if(e<lowest) { lowest=e; result[i]=k; }
+        }
+    }
+    return result;
+}
+
+// Adapted from pack_etc1_RGB_payload. q already contains the selected 4/5-bit codewords.
+uint packEtc1(Fit a,Fit b,uint flip,bool differential) {
+    uint header=flip|(a.table<<5u)|(b.table<<2u);
+    if(differential) {
+        uvec3 d=uvec3(b.q-a.q)&uvec3(7u),q=uvec3(a.q);
+        header|=2u|(q.r<<27u)|(d.r<<24u)|(q.g<<19u)|(d.g<<16u)|(q.b<<11u)|(d.b<<8u);
+    } else {
+        uvec3 x=uvec3(a.q),y=uvec3(b.q);
+        header|=(x.r<<28u)|(y.r<<24u)|(x.g<<20u)|(y.g<<16u)|(x.b<<12u)|(y.b<<8u);
+    }
+    return header;
+}
+// Adapted from pack_etc2_T_RGB_payload; red over/underflow selects ETC2 T mode.
+uint packT(ivec3 qa,ivec3 qb,uint distance) {
+    uvec3 a=uvec3(qa),b=uvec3(qb); uint low=a.r&3u,high=a.r>>2u;
+    uint legacy=high+low<4u ? (1u<<26u) : (7u<<29u);
+    return legacy|(high<<27u)|(low<<24u)|(a.g<<20u)|(a.b<<16u)|
+        (b.r<<12u)|(b.g<<8u)|(b.b<<4u)|((distance&1u))|((distance>>1u)<<2u)|2u;
+}
+
+uvec2 encodeRgbWeighted(ColorSource colors) {
+    uint bestError=0xffffffffu,header=0u,bestFlip=0u; int bestBits=4;
+    Fit bestA,bestB; bool useT=false; uvec4 bestSelectors=uvec4(0u);
+    for(uint flip=0u;flip<2u;++flip) for(int bits=4;bits<=5;++bits) {
+        Fit a=fitHalf(colors,flip,0u,bits),b=fitHalf(colors,flip,1u,bits);
+        ivec3 d=b.q-a.q;
+        if(bits==5 && (any(lessThan(d,ivec3(-4))) || any(greaterThan(d,ivec3(3))))) continue;
+        uint error=a.error+b.error;
+        if(error<bestError) {
+            bestError=error; header=packEtc1(a,b,flip,bits==5);
+            bestA=a; bestB=b; bestFlip=flip; bestBits=bits;
+        }
+    }
+    // Weighted means and first-occurrence ordering retain the frozen T-mode
+    // seeds, chromatic outlier tie, and two clustering updates exactly.
+    ivec3 sum=ivec3(0); int count=0;
+    for(uint i=0u;i<colors.count;++i) { sum+=colors.values[i]*int(colors.weights[i]); count+=int(colors.weights[i]); }
+    ivec3 mean=sum/count,a=mean,b=mean; int furthest=-1;
+    for(uint i=0u;i<colors.count;++i) if(colors.weights[i]!=0u) {
+        ivec3 d=colors.values[i]-mean; int gray=d.r+d.g+d.b;
+        int e=int(rgbError(colors.values[i],mean))-gray*gray/3;
+        if(e>furthest) { furthest=e; b=colors.values[i]; }
+    }
+    for(uint iteration=0u;iteration<2u;++iteration) {
+        ivec3 sa=ivec3(0),sb=ivec3(0); int na=0,nb=0;
+        for(uint i=0u;i<colors.count;++i) if(colors.weights[i]!=0u) {
+            int weight=int(colors.weights[i]);
+            if(rgbError(colors.values[i],a)<=rgbError(colors.values[i],b)) { sa+=colors.values[i]*weight; na+=weight; }
+            else { sb+=colors.values[i]*weight; nb+=weight; }
+        }
+        if(na!=0) a=(sa+na/2)/na;
+        if(nb!=0) b=(sb+nb/2)/nb;
+    }
+    for(uint swap=0u;swap<2u;++swap) {
+        ivec3 qa=quantize(swap==0u ? a : b,4),qb=quantize(swap==0u ? b : a,4);
+        ivec3 ca=expandBase(qa,4),cb=expandBase(qb,4);
+        for(uint t=0u;t<8u;++t) {
+            ivec3 palette[4]=ivec3[4](ca,clamp(cb+distances[t],ivec3(0),ivec3(255)),cb,
+                clamp(cb-distances[t],ivec3(0),ivec3(255)));
+            uint error=0u; uvec4 selectors=uvec4(0u);
+            for(uint i=0u;i<colors.count;++i) {
+                uint lowest=0xffffffffu;
+                for(uint k=0u;k<4u;++k) {
+                    uint e=rgbError(colors.values[i],palette[k]);
+                    if(e<lowest) { lowest=e; selectors[i]=k; }
+                }
+                error+=lowest*colors.weights[i];
+            }
+            if(error<bestError) { bestError=error; header=packT(qa,qb,t); bestSelectors=selectors; useT=true; }
+        }
+    }
+    uvec4 selectorsA=uvec4(0u),selectorsB=uvec4(0u);
+    if(!useT) { selectorsA=halfSelectors(colors,bestA,bestBits); selectorsB=halfSelectors(colors,bestB,bestBits); }
+    uint planes=0u;
+    for(uint p=0u;p<16u;++p) {
+        uint i=(colors.indices>>(p*2u))&3u;
+        uint chosen=useT ? bestSelectors[i] : (inHalf(p,bestFlip,0u) ? selectorsA[i] : selectorsB[i]);
+        planes|=selectorBit(p,chosen);
+    }
+    return uvec2(byteSwap(header),byteSwap(planes));
+}
+
+#ifndef PVB_ETC_BC1_ONLY
+// The common path scores one orientation and one mean-derived base per half.
+// RGB variance chooses the orientation without fitting both orientations.
+// One refinement of the winning table corrects modifier/quantization bias.
+Fit fitHalfQuick(ColorSource colors,uint flip,uint region) {
+    uvec4 weights=colors.halfWeights[flip*2u+region];
+    ivec3 sum=ivec3(0); int count=0;
+    for(uint i=0u;i<colors.count;++i) { sum+=colors.values[i]*int(weights[i]); count+=int(weights[i]); }
+    ivec3 mean=count==0 ? colors.values[0] : (sum+count/2)/count;
+    Fit best; best.q=quantize(mean,4); best.table=0u; best.error=0xffffffffu;
+    ivec3 base=expandBase(best.q,4),bestResidual=ivec3(0);
+    for(uint t=0u;t<8u;++t) {
+        ivec3 palette[4],residual=ivec3(0); uint error=0u;
+        for(uint k=0u;k<4u;++k) palette[k]=clamp(base+rgbModifiers[t][k],ivec3(0),ivec3(255));
+        for(uint i=0u;i<colors.count;++i) if(weights[i]!=0u) {
+            uint lowest=0xffffffffu; ivec3 chosen=base;
+            for(uint k=0u;k<4u;++k) {
+                uint e=rgbError(colors.values[i],palette[k]);
+                if(e<lowest) { lowest=e; chosen=palette[k]; }
+            }
+            error+=lowest*weights[i]; residual+=(colors.values[i]-chosen)*int(weights[i]);
+        }
+        if(error<best.error) { best.error=error; best.table=t; bestResidual=residual; }
+    }
+    if(count!=0) {
+        ivec3 q=quantize(clamp(base+ivec3(floor(vec3(bestResidual)/float(count)+0.5)),ivec3(0),ivec3(255)),4);
+        if(any(notEqual(q,best.q))) {
+            ivec3 palette[4]; uint error=0u;
+            for(uint k=0u;k<4u;++k) palette[k]=clamp(expandBase(q,4)+rgbModifiers[best.table][k],ivec3(0),ivec3(255));
+            for(uint i=0u;i<colors.count;++i) if(weights[i]!=0u) {
+                uint lowest=0xffffffffu;
+                for(uint k=0u;k<4u;++k) lowest=min(lowest,rgbError(colors.values[i],palette[k]));
+                error+=lowest*weights[i];
+            }
+            if(error<best.error) { best.q=q; best.error=error; }
+        }
+    }
+    return best;
+}
+uvec2 encodeRgb(ColorSource colors) {
+    uint count=colors.weights.x+colors.weights.y+colors.weights.z+colors.weights.w;
+    // A per-block bound is deliberately stronger than the corpus RMSE32 gate.
+    // Reserve one byte level for independent BC endpoint expansion differences.
+    uint guard=(colors.visibleTexels==0u ? count : colors.visibleTexels)*3u*31u*31u;
+    float scores[2]=float[2](0.0,0.0);
+    for(uint region=0u;region<4u;++region) {
+        uvec4 weights=colors.halfWeights[region]; ivec3 sum=ivec3(0); uint squareSum=0u,n=0u;
+        for(uint i=0u;i<colors.count;++i) {
+            sum+=colors.values[i]*int(weights[i]); n+=weights[i];
+            squareSum+=rgbError(colors.values[i],ivec3(0))*weights[i];
+        }
+        if(n!=0u) scores[region/2u]+=float(squareSum)-dot(vec3(sum),vec3(sum))/float(n);
+    }
+    uint flip=scores[1]<scores[0] ? 1u : 0u;
+    Fit a=fitHalfQuick(colors,flip,0u),b=fitHalfQuick(colors,flip,1u);
+    uint error=a.error+b.error,header=packEtc1(a,b,flip,false);
+    uvec4 choicesA=halfSelectors(colors,a,4),choicesB=halfSelectors(colors,b,4);
+    bool useT=false; uvec4 choicesT=uvec4(0u);
+    if(error>guard) {
+        // Chromatic BC palettes are poorly represented by scalar ETC1 modifiers.
+        // Two bounded clustering updates and sixteen T palettes cover these
+        // cases without paying for all ETC1 base/table/refinement combinations.
+        ivec3 sum=ivec3(0);
+        for(uint i=0u;i<colors.count;++i) sum+=colors.values[i]*int(colors.weights[i]);
+        ivec3 mean=sum/int(count),ca=mean,cb=mean; int furthest=-1;
+        for(uint i=0u;i<colors.count;++i) if(colors.weights[i]!=0u) {
+            ivec3 d=colors.values[i]-mean; int gray=d.r+d.g+d.b;
+            int e=int(rgbError(colors.values[i],mean))-gray*gray/3;
+            if(e>furthest) { furthest=e; cb=colors.values[i]; }
+        }
+        for(uint iteration=0u;iteration<2u;++iteration) {
+            ivec3 sa=ivec3(0),sb=ivec3(0); int na=0,nb=0;
+            for(uint i=0u;i<colors.count;++i) if(colors.weights[i]!=0u) {
+                int weight=int(colors.weights[i]);
+                if(rgbError(colors.values[i],ca)<=rgbError(colors.values[i],cb)) { sa+=colors.values[i]*weight; na+=weight; }
+                else { sb+=colors.values[i]*weight; nb+=weight; }
+            }
+            if(na!=0) ca=(sa+na/2)/na;
+            if(nb!=0) cb=(sb+nb/2)/nb;
+        }
+        for(uint swap=0u;swap<2u;++swap) {
+            ivec3 qa=quantize(swap==0u ? ca : cb,4),qb=quantize(swap==0u ? cb : ca,4);
+            ivec3 baseA=expandBase(qa,4),baseB=expandBase(qb,4);
+            for(uint t=0u;t<8u;++t) {
+                ivec3 palette[4]=ivec3[4](baseA,clamp(baseB+distances[t],ivec3(0),ivec3(255)),baseB,
+                    clamp(baseB-distances[t],ivec3(0),ivec3(255)));
+                uint trialError=0u; uvec4 choices=uvec4(0u);
+                for(uint i=0u;i<colors.count;++i) {
+                    uint lowest=0xffffffffu;
+                    for(uint k=0u;k<4u;++k) {
+                        uint e=rgbError(colors.values[i],palette[k]);
+                        if(e<lowest) { lowest=e; choices[i]=k; }
+                    }
+                    trialError+=lowest*colors.weights[i];
+                }
+                if(trialError<error) { error=trialError; header=packT(qa,qb,t); choicesT=choices; useT=true; }
+            }
+        }
+    }
+    if(error>guard) return encodeRgbWeighted(colors);
+    uint planes=0u;
+    for(uint p=0u;p<16u;++p) {
+        uint i=(colors.indices>>(p*2u))&3u;
+        uint chosen=useT ? choicesT[i] : (inHalf(p,flip,0u) ? choicesA[i] : choicesB[i]);
+        planes|=selectorBit(p,chosen);
+    }
+    return uvec2(byteSwap(header),byteSwap(planes));
+}
+
+#endif
+
+// EAC8 uses a big-endian 48-bit stream in column-major order, unlike the BC source.
+uvec2 packAlpha(int base,uint table,uint multiplier,uint selectors[16]) {
+    uint high=(uint(base)<<24u)|(multiplier<<20u)|(table<<16u),low=0u;
+    for(uint p=0u;p<16u;++p) {
+        uint i=(p%4u)*4u+p/4u,shift=45u-i*3u,s=selectors[p];
+        if(shift>=32u) high|=s<<(shift-32u);
+        else { low|=s<<shift; if(shift>29u) high|=s>>(32u-shift); }
+    }
+    return uvec2(byteSwap(high),byteSwap(low));
+}
+#ifndef PVB_ETC_BC1_ONLY
+uvec2 alphaSelectors(AlphaSource alphas,int base,uint table,uint multiplier) {
+    int palette[8]; uvec2 choices=uvec2(0u); uint selectors[16];
+    for(uint k=0u;k<8u;++k) palette[k]=clamp(base+int(multiplier)*alphaModifiers[table*8u+k],0,255);
+    for(uint i=0u;i<alphas.count;++i) {
+        uint lowest=0xffffffffu,chosen=0u;
+        for(uint k=0u;k<8u;++k) {
+            int d=alphas.values[i]-palette[k]; uint e=uint(d*d);
+            if(e<lowest) { lowest=e; chosen=k; }
+        }
+        choices[i/8u]|=chosen<<((i%8u)*4u);
+    }
+    for(uint p=0u;p<16u;++p) {
+        uint i=(alphas.indices[p/8u]>>((p%8u)*4u))&15u;
+        selectors[p]=(choices[i/8u]>>((i%8u)*4u))&15u;
+    }
+    return packAlpha(base,table,multiplier,selectors);
+}
+#ifndef PVB_ETC_BC3_ONLY
+uvec2 encodeAlphaWeighted(AlphaSource alphas) {
+    int minimum=255,maximum=0,count=alphas.texels;
+    for(uint i=0u;i<alphas.count;++i) { minimum=min(minimum,alphas.values[i]); maximum=max(maximum,alphas.values[i]); }
+    uint selectors[16];
+    if(minimum==maximum) {
+        // The specification forbids multiplier zero in an encoder. Table13 has a
+        // zero modifier at selector4, so every constant 8-bit alpha is exact.
+        for(uint p=0u;p<16u;++p) selectors[p]=4u;
+        return packAlpha(minimum,13u,1u,selectors);
+    }
+    uint bestError=0xffffffffu,bestPeak=0xffffffffu,bestTable=0u,bestMultiplier=1u; int bestBase=0;
+    // The BC3 input decoder rounds interpolants; independent integer BC decoders
+    // may truncate them, differing by one level. Reserve that level in the guard.
+    uint guard=pc.format>=137u ? 225u : 256u;
+    for(uint t=0u;t<16u;++t) {
+        int lowModifier=alphaModifiers[t*8u+3u],highModifier=alphaModifiers[t*8u+7u];
+        int span=highModifier-lowModifier;
+        int center=clamp((maximum-minimum+span/2)/span,1,15);
+        for(int offset=-1;offset<=1;++offset) {
+            int multiplier=center+offset;
+            if(multiplier<1 || multiplier>15) continue;
+            // Retain exact coverage: whenever the source has alpha0/255, the
+            // candidate palette must clamp to that same endpoint.
+            int lower=maximum==255 ? max(0,255-highModifier*multiplier) : 0;
+            int upper=minimum==0 ? min(255,-lowModifier*multiplier) : 255;
+            if(lower>upper) continue;
+            int base=clamp((minimum+maximum-(lowModifier+highModifier)*multiplier+1)/2,lower,upper);
+            for(uint trial=0u;trial<3u;++trial) {
+                uint error=0u,peak=0u; int residual=0,negativeResidual=255,positiveResidual=-255;
+                int palette[8];
+                for(uint k=0u;k<8u;++k) palette[k]=clamp(base+multiplier*alphaModifiers[t*8u+k],0,255);
+                for(uint i=0u;i<alphas.count;++i) {
+                    uint lowest=0xffffffffu; int chosenAlpha=0;
+                    for(uint k=0u;k<8u;++k) {
+                        int d=alphas.values[i]-palette[k]; uint e=uint(d*d);
+                        if(e<lowest) { lowest=e; chosenAlpha=palette[k]; }
+                    }
+                    error+=lowest*alphas.weights[i]; peak=max(peak,lowest);
+                    int d=alphas.values[i]-chosenAlpha;
+                    residual+=d*int(alphas.weights[i]);
+                    negativeResidual=min(negativeResidual,d); positiveResidual=max(positiveResidual,d);
+                }
+                // Prefer candidates within the alpha guard before minimizing SSE.
+                // If none meet that guard, minimize the maximum error first.
+                // A full BC2 0,17,...255 ramp with exact endpoints needs at least
+                // 17 levels: eight EAC palette values cannot cover it within 16.
+                bool fits=peak<=guard,bestFits=bestPeak<=guard;
+                bool better=(fits && !bestFits) ||
+                    (fits && bestFits && error<bestError) ||
+                    (!fits && !bestFits && (peak<bestPeak || (peak==bestPeak && error<bestError)));
+                if(better) { bestError=error; bestPeak=peak; bestBase=base; bestTable=t; bestMultiplier=uint(multiplier); }
+                if(bestError==0u) return alphaSelectors(alphas,bestBase,bestTable,bestMultiplier);
+                if(trial==2u || (trial==1u && bestPeak<=guard)) break;
+                // First refine squared error. If the guard remains unmet, one
+                // additional refinement balances the worst positive/negative errors.
+                int shift=trial==0u ? int(floor(float(residual)/float(count)+0.5)) :
+                    int(floor(float(negativeResidual+positiveResidual)*0.5+0.5));
+                int next=clamp(base+shift,lower,upper);
+                if(next==base && (trial!=0u || bestPeak<=guard)) break;
+                base=next;
+            }
+        }
+    }
+    return alphaSelectors(alphas,bestBase,bestTable,bestMultiplier);
+}
+
+#endif
+// Bounded BC3 recovery. Every seed is constrained to represent genuine 0/255.
+// Three distribution-derived seeds and one residual update cover shifted/skewed
+// palettes without the previous weighted search plus all-multiplier wide chain.
+// At most 16 tables * 6 multipliers * 3 seeds * 2 trials = 576 palettes.
+uvec2 encodeAlphaRecovery(AlphaSource alphas,int minimum,int maximum) {
+    const uint tables[16]=uint[16](2u,0u,3u,8u,11u,13u,1u,4u,5u,6u,7u,9u,10u,12u,14u,15u);
+    const int offsets[5]=int[5](0,1,-1,2,-2);
+    int sum=0,interiorMinimum=255,interiorMaximum=0;
+    for(uint i=0u;i<alphas.count;++i) {
+        int value=alphas.values[i]; sum+=value*int(alphas.weights[i]);
+        if(value>0 && value<255) { interiorMinimum=min(interiorMinimum,value); interiorMaximum=max(interiorMaximum,value); }
+    }
+    int mean=(sum+alphas.texels/2)/alphas.texels;
+    if(interiorMinimum>interiorMaximum) { interiorMinimum=minimum; interiorMaximum=maximum; }
+    uint bestError=0xffffffffu,bestPeak=0xffffffffu,bestTable=0u,bestMultiplier=1u; int bestBase=0;
+    uint rmsGuard=uint(alphas.texels)*49u;
+    for(uint step=0u;step<16u;++step) {
+        uint table=tables[step];
+        int low=alphaModifiers[table*8u+3u],high=alphaModifiers[table*8u+7u],span=high-low;
+        int center=clamp((maximum-minimum+span/2)/span,1,15);
+        int interiorSpan=alphaModifiers[table*8u+6u]-alphaModifiers[table*8u+2u];
+        int interiorCenter=clamp((interiorMaximum-interiorMinimum+interiorSpan/2)/interiorSpan,1,15);
+        for(uint offset=0u;offset<6u;++offset) {
+            int multiplier=offset<5u ? center+offsets[offset] : interiorCenter;
+            if(offset==5u && abs(interiorCenter-center)<=2) continue;
+            if(multiplier<1 || multiplier>15) continue;
+            int lower=maximum==255 ? max(0,255-high*multiplier) : 0;
+            int upper=minimum==0 ? min(255,-low*multiplier) : 255;
+            if(lower>upper) continue;
+            int seeds[3]=int[3](
+                clamp((minimum+maximum-(low+high)*multiplier+1)/2,lower,upper),
+                clamp(mean,lower,upper),
+                clamp((interiorMinimum+interiorMaximum-(alphaModifiers[table*8u+2u]+alphaModifiers[table*8u+6u])*multiplier+1)/2,lower,upper));
+            for(uint seed=0u;seed<3u;++seed) {
+                if((seed>0u && seeds[seed]==seeds[0]) || (seed==2u && seeds[seed]==seeds[1])) continue;
+                int base=seeds[seed];
+                for(uint trial=0u;trial<2u;++trial) {
+                    int palette[8],residual=0; uint error=0u,peak=0u;
+                    for(uint k=0u;k<8u;++k) palette[k]=clamp(base+multiplier*alphaModifiers[table*8u+k],0,255);
+                    for(uint i=0u;i<alphas.count;++i) {
+                        uint lowest=0xffffffffu; int chosen=0;
+                        for(uint k=0u;k<8u;++k) {
+                            int d=alphas.values[i]-palette[k]; uint e=uint(d*d);
+                            if(e<lowest) { lowest=e; chosen=palette[k]; }
+                        }
+                        error+=lowest*alphas.weights[i]; peak=max(peak,lowest);
+                        residual+=(alphas.values[i]-chosen)*int(alphas.weights[i]);
+                    }
+                    // One-level margin for independently truncated BC source.
+                    if(peak<=225u && error<=rmsGuard) return alphaSelectors(alphas,base,table,uint(multiplier));
+                    bool fits=peak<=225u,bestFits=bestPeak<=225u;
+                    bool better=(fits && !bestFits) ||
+                        (fits && bestFits && error<bestError) ||
+                        (!fits && !bestFits && (peak<bestPeak || (peak==bestPeak && error<bestError)));
+                    if(better) { bestError=error; bestPeak=peak; bestBase=base; bestTable=table; bestMultiplier=uint(multiplier); }
+                    int next=clamp(base+int(floor(float(residual)/float(alphas.texels)+0.5)),lower,upper);
+                    if(next==base) break;
+                    base=next;
+                }
+            }
+        }
+    }
+    // This remains a bounded heuristic; callers must validate original gates.
+    return alphaSelectors(alphas,bestBase,bestTable,bestMultiplier);
+}
+
+uvec2 encodeAlpha(AlphaSource alphas) {
+    int minimum=255,maximum=0;
+    for(uint i=0u;i<alphas.count;++i) { minimum=min(minimum,alphas.values[i]); maximum=max(maximum,alphas.values[i]); }
+    if(minimum==maximum) return alphaSelectors(alphas,minimum,13u,1u);
+    // Native BC1 binary coverage has an exact legal EAC representation.
+    if(alphas.count==2u && minimum==0 && maximum==255) return alphaSelectors(alphas,135,0u,9u);
+    // Basis pack_eac's bounded range-derived four-table fit, altered for
+    // weighted BC values and exact endpoints. Accept on absolute and RMS error,
+    // rather than assuming an SSE optimum satisfies the independent gates.
+    const uint tables[4]=uint[4](2u,8u,11u,13u);
+    uint bestError=0xffffffffu,bestTable=0u,bestMultiplier=1u; int bestBase=0;
+#ifdef PVB_ETC_BC3_ONLY
+    const uint guard=225u;
+#else
+    uint guard=pc.format>=137u ? 225u : 256u;
+#endif
+    uint rmsGuard=uint(alphas.texels)*49u;
+    for(uint trial=0u;trial<4u;++trial) {
+        uint table=tables[trial];
+        int low=alphaModifiers[table*8u+3u],high=alphaModifiers[table*8u+7u],span=high-low;
+        int multiplier=clamp((maximum-minimum+span/2)/span,1,15);
+        if(minimum==0 && maximum==255) multiplier=max(multiplier,(255+span-1)/span);
+        int lower=maximum==255 ? max(0,255-high*multiplier) : 0;
+        int upper=minimum==0 ? min(255,-low*multiplier) : 255;
+        if(lower>upper) continue;
+        int base=clamp(minimum+((maximum-minimum)*(-low)+span/2)/span,lower,upper);
+        int palette[8]; uint error=0u,peak=0u;
+        for(uint k=0u;k<8u;++k) palette[k]=clamp(base+multiplier*alphaModifiers[table*8u+k],0,255);
+        for(uint i=0u;i<alphas.count;++i) {
+            uint lowest=0xffffffffu;
+            for(uint k=0u;k<8u;++k) { int d=alphas.values[i]-palette[k]; lowest=min(lowest,uint(d*d)); }
+            error+=lowest*alphas.weights[i]; peak=max(peak,lowest);
+        }
+        if(peak<=guard && error<=rmsGuard && error<bestError) {
+            bestError=error; bestBase=base; bestTable=table; bestMultiplier=uint(multiplier);
+        }
+    }
+    if(bestError!=0xffffffffu) return alphaSelectors(alphas,bestBase,bestTable,bestMultiplier);
+#ifdef PVB_ETC_BC3_ONLY
+    return encodeAlphaRecovery(alphas,minimum,maximum);
+#else
+    return pc.format>=137u ? encodeAlphaRecovery(alphas,minimum,maximum) : encodeAlphaWeighted(alphas);
+#endif
+}
+
+#endif
+
+void main() {
+    uvec3 q=gl_GlobalInvocationID;
+    uint blocksX=(pc.width+3u)/4u,blocksY=(pc.height+3u)/4u;
+    if(q.x>=blocksX || q.y>=blocksY || q.z>=pc.layers) return;
+#ifdef PVB_ETC_BC1_ONLY
+    if(pc.format<131u || pc.format>134u) return;
+    const bool bc1=true; bool withAlpha=pc.format>=133u;
+#elif defined(PVB_ETC_BC3_ONLY)
+    if(pc.format<137u || pc.format>138u) return;
+    const bool bc1=false,withAlpha=true;
+#else
+    if(pc.format<131u || pc.format>138u) return;
+    bool bc1=pc.format<=134u,withAlpha=pc.format>=133u;
+#endif
+    uint wordsPerBlock=bc1 ? 2u : 4u;
+    uint source=((q.z*pc.blocksHeight+q.y)*pc.blocksRow+q.x)*wordsPerBlock;
+    uvec2 first=uvec2(src.words[source],src.words[source+1u]);
+    uvec2 colorBlock=bc1 ? first : uvec2(src.words[source+2u],src.words[source+3u]);
+    uint validWidth=min(4u,pc.width-q.x*4u),validHeight=min(4u,pc.height-q.y*4u);
+    uvec2 rgb;
+#ifdef PVB_ETC_BC1_ONLY
+    uint opaqueMask=0u;
+#endif
+    {
+        ColorSource colors; colors.count=0u; colors.indices=0u; colors.visibleTexels=0u; colors.weights=uvec4(0u);
+        for(uint i=0u;i<4u;++i) colors.halfWeights[i]=uvec4(0u);
+        for(uint y=0u;y<4u;++y) for(uint x=0u;x<4u;++x) {
+            uint p=y*4u+x,clamped=min(y,validHeight-1u)*4u+min(x,validWidth-1u);
+            uvec4 decoded=bcColor(colorBlock,clamped,!bc1,!withAlpha);
+#ifdef PVB_ETC_BC1_ONLY
+            if(decoded.a!=0u) opaqueMask|=1u<<p;
+#endif
+            ivec3 value=ivec3(decoded.rgb); uint i=0u;
+            while(i<colors.count && any(notEqual(colors.values[i],value))) ++i;
+            if(i==colors.count) { colors.values[i]=value; ++colors.count; }
+            colors.indices|=i<<(p*2u);
+            if(x<validWidth && y<validHeight) {
+                ++colors.weights[i]; ++colors.halfWeights[x/2u][i]; ++colors.halfWeights[2u+y/2u][i];
+#ifdef PVB_ETC_BC1_ONLY
+                uint alpha=decoded.a;
+#elif defined(PVB_ETC_BC3_ONLY)
+                uint alpha=bcAlphaFloor(first,clamped);
+#else
+                uint alpha=bc1 ? decoded.a : (pc.format<=136u ? ((first[clamped/8u]>>((clamped%8u)*4u))&15u)*17u : bcAlphaFloor(first,clamped));
+#endif
+                colors.visibleTexels+=alpha!=0u ? 1u : 0u;
+            }
+        }
+#ifdef PVB_ETC_BC1_ONLY
+        rgb=encodeRgbWeighted(colors);
+#else
+        rgb=encodeRgb(colors);
+#endif
+    }
+    uint target=((q.z*blocksY+q.y)*blocksX+q.x)*(withAlpha ? 4u : 2u);
+    if(withAlpha) {
+#ifdef PVB_ETC_BC1_ONLY
+        uint selectors[16];
+        for(uint p=0u;p<16u;++p) selectors[p]=((opaqueMask>>p)&1u)!=0u ? 7u : 3u;
+        uvec2 alpha=packAlpha(135,0u,9u,selectors);
+#else
+        AlphaSource alphas; alphas.count=0u; alphas.indices=uvec2(0u); alphas.texels=0;
+        for(uint i=0u;i<PVB_ALPHA_VALUES;++i) alphas.weights[i]=0u;
+        for(uint y=0u;y<4u;++y) for(uint x=0u;x<4u;++x) {
+            uint p=y*4u+x,clamped=min(y,validHeight-1u)*4u+min(x,validWidth-1u);
+            int value;
+#ifdef PVB_ETC_BC3_ONLY
+            value=int(bcAlpha(first,clamped));
+#else
+            if(bc1) value=bcColor(colorBlock,clamped,false,false).a==0u ? 0 : 255;
+            else value=pc.format<=136u ? int(((first[clamped/8u]>>((clamped%8u)*4u))&15u)*17u) : int(bcAlpha(first,clamped));
+#endif
+            uint i=0u;
+            while(i<alphas.count && alphas.values[i]!=value) ++i;
+            if(i==alphas.count) { alphas.values[i]=value; ++alphas.count; }
+            alphas.indices[p/8u]|=i<<((p%8u)*4u);
+            if(x<validWidth && y<validHeight) { ++alphas.weights[i]; ++alphas.texels; }
+        }
+        uvec2 alpha=encodeAlpha(alphas);
+#endif
+        dst.words[target]=alpha.x; dst.words[target+1u]=alpha.y; target+=2u;
+    }
+    dst.words[target]=rgb.x; dst.words[target+1u]=rgb.y;
+}
